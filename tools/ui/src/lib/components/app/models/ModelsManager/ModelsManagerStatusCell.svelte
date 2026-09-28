@@ -1,6 +1,7 @@
 <script lang="ts">
 	import ModelLoadControl from '../ModelLoadControl.svelte';
 	import ModelsManagerDownloadControl from './ModelsManagerDownloadControl.svelte';
+	import { canLoadOption } from './utils';
 	import type { ModelRowDownloadState } from '$lib/constants';
 	import { ServerModelStatus } from '$lib/enums';
 	import { modelsStore } from '$lib/stores';
@@ -27,11 +28,13 @@
 	<ModelsManagerDownloadControl class="justify-self-center {className}" {option} state={download} />
 {:else}
 	<ModelLoadControl
+		canLoad={canLoadOption(option)}
 		class="justify-self-center {className}"
 		isFailed={status === ServerModelStatus.FAILED}
 		{isLoaded}
 		isLoading={status === ServerModelStatus.LOADING || isOperationInProgress}
 		isSleeping={status === ServerModelStatus.SLEEPING}
 		{option}
+		showRemoteMark
 	/>
 {/if}

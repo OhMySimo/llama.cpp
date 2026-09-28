@@ -5,6 +5,7 @@ import {
 	ModelGroupKind,
 	type ModelSidecar,
 	ModelsTableGroupKind,
+	ModelsTableProviderKind,
 	SETTINGS_KEYS,
 	SPEC_TYPE
 } from '$lib/constants';
@@ -15,6 +16,7 @@ import type {
 	ModelDownloadProgress,
 	ModelLoadProgress,
 	ModelOption,
+	ModelSidecarBadge,
 	ModelSidecarFile
 } from '$lib/types/models';
 import { detectThinkingSupport, detectToolUseSupport } from '$lib/utils';
@@ -115,29 +117,9 @@ export interface ModelsTableGroup {
 	isLocal?: boolean;
 	key: string;
 	/** Manager sections use the kind constants, provider blocks their own kinds. */
-	kind: ModelsTableGroupKind | 'compat' | 'provider';
+	kind: ModelsTableGroupKind | ModelsTableProviderKind;
 	label: string;
 }
-
-/** Values the load form falls back to when the server reports nothing. */
-export const LOAD_DEFAULTS = {
-	batchSize: 2048,
-	contextLength: 8192,
-	cpuThreads: 13,
-	gpuOffload: 42,
-	speculativeDecoding: 'off',
-	ubatchSize: 512
-};
-
-export const SAMPLING_DEFAULTS = {
-	minP: 0.05,
-	repeatPenalty: 1.1,
-	temperature: 1,
-	topK: 64,
-	topP: 0.95
-};
-
-export const SPECULATIVE_OPTIONS = ['off', 'draft-model'];
 
 /** True when the user saved anything for this model. */
 export function isCustomized(override?: ModelOverride): boolean {
@@ -306,6 +288,31 @@ export function modelDrafts(
 }
 
 /**
+ * Draft sidecars of a model, as ModelId badges them: what the store's listing reports
+ * plus the drafts a load would use, one kind/quant pair per sidecar.
+ */
+export function modelDraftBadges(
+	option: ModelOption,
+	settingValue?: string | null
+): ModelSidecarBadge[] {
+	const badges = [...(option.draftSidecars ?? [])];
+
+	for (const draft of modelDraftsFor(option, settingValue)) {
+		if (!draft.kind) continue;
+
+		if (badges.some((badge) => badge.kind === draft.kind && badge.quant === draft.quant)) continue;
+
+		badges.push({
+			kind: draft.kind,
+			quant: draft.quant,
+			repo: draft.model ?? repoOf(option.model) ?? ''
+		});
+	}
+
+	return badges;
+}
+
+/**
  * Whether a model has a capability. A listing that declares nothing is not a listing
  * that lacks it: the chat template the Hub carries says whether tools or reasoning work.
  */
@@ -320,8 +327,23 @@ export function isModelRunning(option: ModelOption): boolean {
 }
 
 /** Context the model runs with: what a loaded model reports. */
-export function configuredContext(option: ModelOption): number | null {
+/** Context the model runs with: the stored override, else what a loaded local model reports. */
+export function configuredContext(
+	option: ModelOption,
+	overrides?: Record<string, ModelOverride>
+): number | null {
+	const override = overrides?.[option.id]?.load?.contextLength;
+
+	if (override) return override;
+
+	if (!isLocalOption(option)) return null;
+
 	return isModelRunning(option) ? modelsStore.props.getModelContextSize(option.model) : null;
+}
+
+/** True when the backend that serves the model can load and unload it. */
+export function canLoadOption(option: ModelOption): boolean {
+	return getBackendCapabilities(getBackend(option.backendId)).loadUnload;
 }
 
 export function modelSupports(option: ModelOption, capability: ModelCapability): boolean {
@@ -442,7 +464,7 @@ export function groupModelQuants(models: ModelOption[], mergeProviders = false):
 		// the very same id twice is not a quant set; keep those rows apart, unless
 		// the group exists to list the providers that serve it
 		if (
-			kind !== 'providers' &&
+			kind !== ModelGroupKind.PROVIDERS &&
 			modelIds.length > 1 &&
 			modelIds.every((model) => model === modelIds[0])
 		) {
@@ -463,7 +485,7 @@ export function groupModelQuants(models: ModelOption[], mergeProviders = false):
 function groupKind(quants: ModelOption[]): ModelGroupKind {
 	const backends = new Set(quants.map((option) => option.backendId ?? ''));
 
-	if (backends.size > 1) return 'providers';
+	if (backends.size > 1) return ModelGroupKind.PROVIDERS;
 
 	const isQuant = quants.every(
 		(option) => (option.parsedId ?? ModelsService.parseModelId(option.model)).quantization
