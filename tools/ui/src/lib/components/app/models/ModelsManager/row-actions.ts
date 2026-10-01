@@ -1,5 +1,4 @@
-import { Eye, EyeOff, Heart, HeartOff, Trash2 } from '@lucide/svelte';
-import { Search } from '@lucide/svelte';
+import { Compass, Eye, EyeOff, Heart, HeartOff, Trash2 } from '@lucide/svelte';
 import { MODEL_DOWNLOAD_ICONS, MODEL_ID, ModelRowDownloadState } from '$lib/constants';
 import { modelsStore, uiStore } from '$lib/stores';
 import type { ModelOption } from '$lib/types/models';
@@ -14,7 +13,7 @@ export function modelRowActions(
 	download?: ModelRowDownloadState | null
 ) {
 	const viewInDiscover = {
-		icon: Search,
+		icon: Compass,
 		label: 'View in Discover',
 		// the details pane is keyed by repo, not by `<repo>:<quant>`
 		onclick: () =>
