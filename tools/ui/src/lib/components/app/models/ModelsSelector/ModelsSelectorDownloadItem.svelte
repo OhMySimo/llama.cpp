@@ -1,10 +1,11 @@
 <script lang="ts">
 	import ModelDownloadProgressBar from '../ModelDownloadProgressBar.svelte';
 	import ModelOrgAvatar from '../ModelOrgAvatar.svelte';
-	import { Loader2, Pause, Play, X } from '@lucide/svelte';
+	import { Loader2, Pause, Play, Search, X } from '@lucide/svelte';
 	import { ActionIcon, ModelId } from '$lib/components/app';
+	import { MODEL_ID } from '$lib/constants';
 	import { HuggingFaceService, ModelsService } from '$lib/services';
-	import { modelsStore } from '$lib/stores';
+	import { modelsStore, uiStore } from '$lib/stores';
 	import type { ModelDownloadProgress } from '$lib/types';
 
 	interface Props {
@@ -107,6 +108,15 @@
 	</button>
 
 	<!-- the row actions keep the sizing and reveal of the other selector rows -->
+	<ActionIcon
+		ariaLabel="View in Discover"
+		class="pointer-events-none h-5 w-5 shrink-0 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 hover:text-foreground [@media(pointer:coarse)]:pointer-events-auto [@media(pointer:coarse)]:opacity-100"
+		icon={Search}
+		iconSize="h-4 w-4"
+		onclick={() =>
+			uiStore.openModelsDiscover(entry.repoWithTag.split(MODEL_ID.QUANTIZATION_SEPARATOR)[0])}
+	/>
+
 	<ActionIcon
 		ariaLabel="Cancel downloading"
 		class="pointer-events-none h-5 w-5 shrink-0 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 hover:text-destructive [@media(pointer:coarse)]:pointer-events-auto [@media(pointer:coarse)]:opacity-100"
