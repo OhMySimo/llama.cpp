@@ -2461,6 +2461,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        ggml_tensor * build_moe_tiered(ggml_tensor * cur, const int il);
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
                             int   il);

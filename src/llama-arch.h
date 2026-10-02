@@ -484,6 +484,9 @@ enum llm_tensor {
     LLM_TENSOR_FFN_UP_EXP,
     LLM_TENSOR_FFN_NORM_EXPS,
     LLM_TENSOR_FFN_DOWN_EXPS, // merged experts
+    LLM_TENSOR_FFN_GATE_EXPS_T2, // tiered experts: second (lower-precision) group
+    LLM_TENSOR_FFN_UP_EXPS_T2,
+    LLM_TENSOR_FFN_DOWN_EXPS_T2,
     LLM_TENSOR_FFN_GATE_EXPS,
     LLM_TENSOR_FFN_UP_EXPS,
     LLM_TENSOR_FFN_GATE_UP_EXPS,

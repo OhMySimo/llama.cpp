@@ -274,8 +274,23 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
+        // tiered experts (fork): two expert tensors per projection with different quant types; each group ends with one
+        // all-zero dummy expert, router rows are ordered [group 1 | group 2] (see tools: split_tiers.py)
+        const ggml_tensor * t2meta = (flags & TENSOR_SKIP) ? nullptr : ml.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS_T2, "weight", il).str().c_str());
+        if (t2meta) {
+            const ggml_tensor * t1meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il).str().c_str());
+            GGML_ASSERT(t1meta && t1meta->ne[2] + t2meta->ne[2] - 2 == n_expert);
+            const int64_t n1 = t1meta->ne[2], n2 = t2meta->ne[2];
+            layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", il), { n_ff_exp, n_embd, n1 }, flags);
+            layer.ffn_gate_exps    = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS,    "weight", il), { n_embd, n_ff_exp, n1 }, flags);
+            layer.ffn_up_exps      = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,      "weight", il), { n_embd, n_ff_exp, n1 }, flags);
+            layer.ffn_down_exps_t2 = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_T2, "weight", il), { n_ff_exp, n_embd, n2 }, flags);
+            layer.ffn_gate_exps_t2 = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_T2, "weight", il), { n_embd, n_ff_exp, n2 }, flags);
+            layer.ffn_up_exps_t2   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_T2,   "weight", il), { n_embd, n_ff_exp, n2 }, flags);
+        } else {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        }
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
@@ -1161,10 +1176,51 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     return cur;
 }
 
+// tiered experts (fork): same routing as build_moe_ffn (softmax, top-k over ALL experts, renormalised weights), then
+// one mul_mat_id per group; a slot routed to the other group points at that group's all-zero dummy expert
+ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, const int il) {
+    const auto & L = model.layers[il];
+    const int64_t n_tok = cur->ne[1];
+    const int64_t k     = n_expert_used;
+    const int64_t n1    = L.ffn_down_exps->ne[2] - 1;
+    const int64_t n2    = L.ffn_down_exps_t2->ne[2] - 1;
+
+    ggml_tensor * probs = ggml_soft_max(ctx0, build_lora_mm(L.ffn_gate_inp, cur));                      // [n_expert, n_tok]
+    ggml_tensor * sel   = ggml_argsort_top_k(ctx0, probs, k);                                             // [k, n_tok]
+    ggml_tensor * w     = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tok), sel);     // [1, k, n_tok]
+    w = ggml_reshape_2d(ctx0, w, k, n_tok);
+    w = ggml_div(ctx0, w, ggml_clamp(ctx0, ggml_sum_rows(ctx0, w), 6.103515625e-5, INFINITY));
+    if (hparams.expert_weights_scale != 0.0f && hparams.expert_weights_scale != 1.0f) {
+        w = ggml_scale(ctx0, w, hparams.expert_weights_scale);
+    }
+    ggml_tensor * self = ggml_cast(ctx0, sel, GGML_TYPE_F32);
+    ggml_tensor * x    = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tok);
+
+    auto tier = [&](ggml_tensor * gate, ggml_tensor * up, ggml_tensor * down, float lo, int64_t n) {
+        // m = 1 if lo <= sel < lo + n ; local id = sel - lo inside the group, n (= the zero dummy) outside
+        ggml_tensor * m   = ggml_mul(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, self,  1.0f, 0.5f - lo)),
+                                           ggml_step(ctx0, ggml_scale_bias(ctx0, self, -1.0f, lo + (float) n - 0.5f)));
+        ggml_tensor * idf = ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, self, 1.0f, -lo), m),
+                                           ggml_scale_bias(ctx0, m, -(float) n, (float) n));
+        ggml_tensor * ids = ggml_cast(ctx0, idf, GGML_TYPE_I32);
+        ggml_tensor * g = build_lora_mm_id(gate, x, ids, nullptr);   // [n_ff, k, n_tok]
+        ggml_tensor * u = build_lora_mm_id(up,   x, ids, nullptr);
+        return build_lora_mm_id(down, ggml_swiglu_split(ctx0, g, u), ids, nullptr);  // [n_embd, k, n_tok]
+    };
+    ggml_tensor * e = ggml_add(ctx0, tier(L.ffn_gate_exps,    L.ffn_up_exps,    L.ffn_down_exps,    0.0f,        n1),
+                                     tier(L.ffn_gate_exps_t2, L.ffn_up_exps_t2, L.ffn_down_exps_t2, (float) n1, n2));
+    e = ggml_mul(ctx0, e, ggml_reshape_3d(ctx0, w, 1, k, n_tok));
+    ggml_tensor * out = ggml_view_2d(ctx0, e, n_embd, n_tok, e->nb[2], 0);
+    for (int64_t i = 1; i < k; ++i) {
+        out = ggml_add(ctx0, out, ggml_view_2d(ctx0, e, n_embd, n_tok, e->nb[2], i*e->nb[1]));
+    }
+    return out;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
+    ggml_tensor * moe_out = model.layers[il].ffn_down_exps_t2 ? build_moe_tiered(cur, il) :
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
             model.layers[il].ffn_up_exps,

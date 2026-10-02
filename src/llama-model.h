@@ -340,6 +340,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
+    struct ggml_tensor * ffn_gate_exps_t2  = nullptr; // tiered experts (qwen4exp): second group, own quant type
+    struct ggml_tensor * ffn_up_exps_t2    = nullptr;
+    struct ggml_tensor * ffn_down_exps_t2  = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
