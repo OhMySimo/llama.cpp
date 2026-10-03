@@ -1173,7 +1173,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (DKQ <= 256)
 #endif // GGML_USE_HIP
     {
-        if (Q->ne[1] > 16/ncols2) {
+        // RDNA2 (e.g. RX 6700 XT): the 32-column D=256 tile kernel gets zero occupancy (launch_fattn asserts), use 16
+        if (Q->ne[1] > 16/ncols2 && !(DKQ >= 256 && GGML_CUDA_CC_IS_RDNA2(cc))) {
             constexpr int cols_per_block = 32;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
