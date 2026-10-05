@@ -1,3 +1,111 @@
+# llama.cpp fork: tiered experts (for Wren_T3 / Wren_T3-v2)
+
+This fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) adds **two expert groups per MoE layer**, each with its
+own quantization type. The routing is unchanged. The fork is needed to run the per-expert mixed-precision GGUFs
+of **Wren**: `Wren_T3.gguf`, `Wren_T3-v2.gguf` and `Wren_T4-*.gguf` from
+[ohmysimo/Wren-GGUF](https://huggingface.co/ohmysimo/Wren-GGUF). (`Wren_Q4_K_M.gguf` and `Wren_T1.gguf` also run on
+upstream llama.cpp.)
+
+Wren is a 50%-expert-pruned and re-healed Swift1.5-Qwen3.8-Flash-Next. **Wren_T3-v2** is the recommended file:
+- size: 60.4 GB;
+- quiz: 83.0, against 80.7 for T3 on the same backend;
+- perplexity: 7% lower than T3.
+
+The model card has the details.
+
+> Use the **`tiered-experts` branch** of this repository (the default branch). It contains the expert-tier support,
+> the CUDA/HIP fix for an expert repeated within a token, and the RDNA2 flash-attention fix.
+
+## Hardware
+
+The setup this was tested on: one 12 GB GPU + 64 GB RAM.
+- The routed experts and the n-gram table stay in system RAM, about 56 GB.
+- Everything else goes on the GPU.
+- With a q8_0 KV cache, the full 262,144-token context needs about 10 GB of VRAM.
+
+CPU-only also works, but slowly (about 5 tokens/s).
+
+## 1. Build
+
+```bash
+git clone -b tiered-experts https://github.com/OhMySimo/llama.cpp llama-tiered
+cd llama-tiered
+```
+
+Pick **one** backend:
+
+```bash
+# NVIDIA (CUDA)
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+
+# AMD (ROCm/HIP). Set GPU_TARGETS to your GPU: gfx1030 = RX 6000 series, gfx1100 = RX 7900, ...
+HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+  cmake -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1030 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+
+# Any GPU (Vulkan). At run time add --no-op-offload (see below)
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+
+# CPU only
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+```
+
+The binaries end up in `build/bin/`.
+
+## 2. Download the model
+
+```bash
+pip install -U huggingface_hub
+hf download ohmysimo/Wren-GGUF Wren_T3-v2.gguf --local-dir models
+```
+
+## 3. Run
+
+This starts an OpenAI-compatible server with a web UI at http://127.0.0.1:8080:
+
+```bash
+build/bin/llama-server -m models/Wren_T3-v2.gguf \
+  -ngl 99 -ot "exps=CPU,per_layer_token_embd=CPU" -fa on \
+  -c 262144 -ctk q8_0 -ctv q8_0 --jinja --reasoning-effort xhigh \
+  --temp 1.0 --top-p 0.95 --top-k 20 --cache-ram 2048 --port 8080
+```
+
+What the flags do:
+
+| Flag | Why |
+|---|---|
+| `-ngl 99 -ot "exps=CPU,per_layer_token_embd=CPU"` | Keeps the experts and the n-gram table in RAM and everything else on the GPU. Pass the overrides as **one comma-separated `-ot`**: with repeated `-ot` flags only the last one is applied. |
+| `-c 262144 -ctk q8_0 -ctv q8_0` | Full native context with a q8_0 KV cache, about 10 GB of VRAM. Lower `-c` if you have less VRAM. |
+| `--jinja --reasoning-effort xhigh` | The model's chat template, with reasoning at **xhigh**: the mode in which Swift was trained to reason concisely. |
+| `--temp 1.0 --top-p 0.95 --top-k 20` | Recommended sampling. |
+| `--cache-ram 2048` | Keep the prompt cache small on 64 GB machines. A large one on top of a 60 GB model pushes the system into swap and generation drops to almost zero. |
+
+Backend notes:
+- **Vulkan:** add `--no-op-offload`. Without it the expert matmuls offloaded to the GPU produce NaN.
+- **AMD RDNA2 (RX 6000) with ROCm:** `-fa on` needs this branch (commit `daaf72c` or later).
+- **CPU only:** drop `-ngl` and `-ot`.
+
+For a quick test in the terminal, use the same flags with `build/bin/llama-cli -m models/Wren_T3-v2.gguf ...`.
+
+**Measured speed** on an RX 6700 XT 12 GB + i9-14900KS + 64 GB RAM (ROCm):
+- about 11 tokens/s generation;
+- 234 tokens/s prefill.
+
+## Troubleshooting
+
+- **`unknown model architecture` or tensor-type errors:** you are not on the `tiered-experts` branch, or the build is
+  older than the fork.
+- **Very slow generation or a frozen machine:** RAM is full. Close other programs, keep `--cache-ram` small and use
+  `-ot` exactly as above.
+- **Garbage or NaN output on Vulkan:** add `--no-op-offload`.
+
+---
+
+*The original llama.cpp README follows.*
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
