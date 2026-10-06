@@ -1555,7 +1555,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
         if (eg) e = ggml_add(ctx0, eg, e);
     }
     e = ggml_mul(ctx0, e, ggml_reshape_3d(ctx0, w, 1, k, n_tok));
-    if (!getenv("LLAMA_TIER_ADDCHAIN")) {   // sum over the k slots in one reduction instead of k-1 adds
+    if (getenv("LLAMA_TIER_SUMROWS")) {   // opt-in: one reduction instead of k-1 adds (NOT bit-identical: sum order)
         ggml_tensor * t = ggml_cont(ctx0, ggml_permute(ctx0, e, 1, 0, 2, 3));      // [k, n_embd, n_tok]
         return ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, t), n_embd, n_tok);
     }
