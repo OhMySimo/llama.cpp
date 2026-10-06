@@ -4378,7 +4378,45 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // LLAMA_KERNEL_PROF=1 (fork; run with GGML_CUDA_DISABLE_GRAPHS=1): per-kernel GPU time from events around each
+                // node, no extra synchronization inside the graph; summary per token (49 GPU splits) every 32 tokens
+                static const bool kprof = getenv("LLAMA_KERNEL_PROF") != nullptr;
+                static std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kp_ev;
+                static std::vector<std::string> kp_key;
+                static size_t kp_n = 0;
+                if (kprof) {
+                    if (kp_n >= kp_ev.size()) {
+                        cudaEvent_t a_, b_; CUDA_CHECK(cudaEventCreateWithFlags(&a_, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&b_, 0));
+                        kp_ev.push_back({a_, b_}); kp_key.emplace_back();
+                    }
+                    CUDA_CHECK(cudaEventRecord(kp_ev[kp_n].first, cuda_ctx->stream()));
+                    std::string key = ggml_op_desc(node);
+                    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) key += std::string(" ") + ggml_type_name(node->src[0]->type) + " " + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1]);
+                    kp_key[kp_n] = key;
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (kprof) {
+                    CUDA_CHECK(cudaEventRecord(kp_ev[kp_n].second, cuda_ctx->stream()));
+                    kp_n++;
+                    if (i == cgraph->n_nodes - 1) {
+                        static std::map<std::string, std::pair<double, long>> acc;
+                        static long calls = 0;
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        for (size_t q = 0; q < kp_n; q++) {
+                            float ms = 0; CUDA_CHECK(hipEventElapsedTime(&ms, kp_ev[q].first, kp_ev[q].second));
+                            auto & e = acc[kp_key[q]]; e.first += ms; e.second++;
+                        }
+                        kp_n = 0;
+                        if (++calls % (49 * 32) == 0) {
+                            std::vector<std::pair<double, std::string>> v; double tot = 0;
+                            for (auto & kv : acc) { v.push_back({kv.second.first / 32, kv.first + " x" + std::to_string(kv.second.second / 32)}); tot += kv.second.first / 32; }
+                            std::sort(v.rbegin(), v.rend());
+                            fprintf(stderr, "[kernel-prof] GPU kernel time per token %.2f ms\n", tot);
+                            for (size_t q = 0; q < v.size() && q < 22; q++) fprintf(stderr, "[kernel-prof] %7.3f ms  %s\n", v[q].first, v[q].second.c_str());
+                            acc.clear();
+                        }
+                    }
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4488,6 +4526,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    {   // LLAMA_GRAPH_DEBUG=1: how often CUDA/HIP graphs are used, and why not
+        static int dbg = -1; if (dbg < 0) { const char * e = getenv("LLAMA_GRAPH_DEBUG"); dbg = e ? atoi(e) : 0; }
+        if (dbg) {
+            static long n_calls = 0, n_used = 0, n_capture = 0, n_incompat = 0, n_disabled = 0;
+            n_calls++; n_used += use_cuda_graph; n_capture += use_cuda_graph && cuda_graph_update_required;
+#ifdef USE_CUDA_GRAPH
+            ggml_cuda_graph * g_dbg = cuda_ctx->cuda_graph(graph_key);
+            n_disabled += !g_dbg->is_enabled(); n_incompat += g_dbg->is_enabled() && !ggml_cuda_graph_check_compability(cgraph);
+#endif
+            if (n_calls % 2000 == 0) fprintf(stderr, "[graph-dbg] calls %ld used %ld captures %ld disabled %ld incompatible %ld\n",
+                                             n_calls, n_used, n_capture, n_disabled, n_incompat);
+        }
+    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {

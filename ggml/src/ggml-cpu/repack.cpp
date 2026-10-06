@@ -5,6 +5,8 @@
 
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
+extern "C" ggml_cpu_mmid_hook_t ggml_cpu_mmid_hook;
+extern "C" void * ggml_cpu_mmid_hook_ud;
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "traits.h"
@@ -4861,10 +4863,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+            if ((src0->flags & GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP) && ggml_cpu_mmid_hook) {
+                for (int a = 0; a < n_as; a++) {
+                    if (matrix_row_counts[a] > 0 && !(a == n_as - 1 && (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT))) {
+                        ggml_cpu_mmid_hook(src0, a, matrix_row_counts[a], true, ggml_cpu_mmid_hook_ud);
+                    }
+                }
+            }
         }
 
         ggml_barrier(params->threadpool);
 
+        if (ith == 0 && getenv("LLAMA_EC_DBG")) {
+            static int d = 0; if (d < 4) { d++; fprintf(stderr, "[repack-mmid] %s flags %d hook %p\n", src0->name, src0->flags, (void *) ggml_cpu_mmid_hook); }
+        }
         // compute each matrix multiplication in sequence
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
@@ -4890,6 +4902,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             if (src0_cur_start >= src0_cur_end) {
                 return;
+            }
+
+            // (fork) tiered experts: the last expert is an all-zero dummy -> write zeros for this thread's slice
+            if ((cur_a == n_as - 1 && (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT)) ||
+                ((src0->flags & GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP) && ggml_cpu_mmid_hook &&
+                 ggml_cpu_mmid_hook(src0, cur_a, cne1, false, ggml_cpu_mmid_hook_ud))) {
+                for (int ir1 = 0; ir1 < nr1; ir1++) {
+                    struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1);
+                    memset((float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start, 0,
+                           (src0_cur_end - src0_cur_start) * sizeof(float));
+                }
+                continue;
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {

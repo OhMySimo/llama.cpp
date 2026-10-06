@@ -141,6 +141,11 @@ extern "C" {
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
+    // (fork) MUL_MAT_ID hook for weights flagged GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP: count=true reports that `expert`
+    // got n_rows rows (called once per op, thread 0); count=false asks whether to skip it (rows become zeros)
+    typedef bool (*ggml_cpu_mmid_hook_t)(const struct ggml_tensor * src0, int32_t expert, int64_t n_rows, bool count, void * user_data);
+    GGML_BACKEND_API void ggml_cpu_set_mmid_hook(ggml_cpu_mmid_hook_t hook, void * user_data);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp16_to_fp32(const ggml_fp16_t *, float *, int64_t);

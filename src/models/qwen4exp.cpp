@@ -4,6 +4,13 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <array>
+#include <fstream>
+#include <unordered_map>
+#include <fcntl.h>
+#include <unistd.h>
+#include "ggml-backend.h"
+#include "gguf.h"
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -168,7 +175,10 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
+static std::string g_qwen4exp_model_path;   // (fork) for the expert cache: experts are read from the file
+
 void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+    g_qwen4exp_model_path = ml.fname_main;
     LLAMA_LOAD_LOCALS;
 
     const int64_t hc     = hparams.dsv4_hc_mult;
@@ -287,6 +297,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_down_exps_t2 = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_T2, "weight", il), { n_ff_exp, n_embd, n2 }, flags);
             layer.ffn_gate_exps_t2 = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_T2, "weight", il), { n_embd, n_ff_exp, n2 }, flags);
             layer.ffn_up_exps_t2   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_T2,   "weight", il), { n_embd, n_ff_exp, n2 }, flags);
+            // the slots routed to the other group point at this group's zero dummy: backends may skip it
+            for (ggml_tensor * t : { layer.ffn_down_exps, layer.ffn_gate_exps, layer.ffn_up_exps,
+                                     layer.ffn_down_exps_t2, layer.ffn_gate_exps_t2, layer.ffn_up_exps_t2 }) {
+                // flags are set at load: the scheduler's copies of these tensors inherit them
+                if (t) t->flags |= GGML_TENSOR_FLAG_ZERO_LAST_EXPERT | (getenv("LLAMA_EXPERT_CACHE") ? GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP : 0);
+            }
         } else {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
@@ -1176,6 +1192,293 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     return cur;
 }
 
+// ---- (fork) adaptive expert cache for tiered experts -------------------------------------------------------------
+// The most used experts of each (layer, group) are copied to VRAM and computed there, in parallel with the CPU, which
+// skips them (GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP + ggml_cpu_set_mmid_hook) and counts every expert it is handed.
+// Between generated tokens, cold cached experts are swapped for hot uncached ones (same slots, same group). The model
+// file is not changed: same experts, same types. Env:
+//   LLAMA_EXPERT_CACHE=<profile> (tools/expert_cache_profile.py)   LLAMA_EXPERT_CACHE_MB (2048)
+//   LLAMA_EXPERT_CACHE_EVERY (tokens between adaptations, 32)       LLAMA_EXPERT_CACHE_SWAPS (max swaps each, 24)
+// ponytail: one model per process (static state); slots per (layer, group) fixed by the profile.
+namespace {
+typedef bool (*ggml_cpu_mmid_hook_fn)(const ggml_tensor * src0, int32_t expert, int64_t n_rows, bool count, void * ud);
+struct ecache_group {
+    ggml_tensor * base[3]  = {nullptr, nullptr, nullptr};  // gate, up, down (CPU)
+    ggml_tensor * cache[3] = {nullptr, nullptr, nullptr};  // [ne0, ne1, cap + 1] on the GPU, slot cap = zero dummy
+    ggml_tensor * map = nullptr;                            // F32 [1, n_expert]: global id -> slot, or cap
+    int lo = 0, n = 0, cap = 0;                             // this group's experts are global ids lo .. lo + n - 1
+    std::vector<int>   slot_of;                             // local expert -> slot, -1 = not cached
+    std::vector<int>   expert_in;                           // slot -> local expert
+    std::vector<float> score;                               // decayed uses per local expert
+    std::vector<float> mapv;
+};
+struct tier_maps {     // (fork) per tiered layer: global expert id -> group-local id, or the group's zero dummy
+    const llama_model * model = nullptr;
+    ggml_context * ctx = nullptr; ggml_backend_buffer_t buf = nullptr;
+    std::vector<std::array<ggml_tensor *, 2>> m;
+};
+tier_maps g_tm;
+
+void tier_maps_init(const llama_model & model) {
+    for (const auto & l : model.layers) if (l.ffn_down_exps_t2 && !l.ffn_down_exps_t2->buffer) return;   // fit probe
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!gpu) return;
+    if (g_tm.buf) ggml_backend_buffer_free(g_tm.buf);
+    if (g_tm.ctx) ggml_free(g_tm.ctx);
+    g_tm = tier_maps();
+    g_tm.model = &model;
+    const int n_layer = (int) model.layers.size();
+    ggml_init_params ip = { (size_t) 2 * n_layer * ggml_tensor_overhead(), nullptr, true };
+    g_tm.ctx = ggml_init(ip);
+    g_tm.m.assign(n_layer, {nullptr, nullptr});
+    for (int il = 0; il < n_layer; il++) {
+        if (!model.layers[il].ffn_down_exps_t2) continue;
+        for (int gi = 0; gi < 2; gi++) g_tm.m[il][gi] = ggml_new_tensor_2d(g_tm.ctx, GGML_TYPE_F32, 1, model.hparams.n_expert);
+    }
+    g_tm.buf = ggml_backend_alloc_ctx_tensors_from_buft(g_tm.ctx, ggml_backend_dev_buffer_type(gpu));
+    if (!g_tm.buf) { g_tm.model = nullptr; return; }
+    ggml_backend_buffer_set_usage(g_tm.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> v(model.hparams.n_expert);
+    for (int il = 0; il < n_layer; il++) {
+        const auto & l = model.layers[il];
+        if (!l.ffn_down_exps_t2) continue;
+        const int n1 = (int) l.ffn_down_exps->ne[2] - 1, n2 = (int) l.ffn_down_exps_t2->ne[2] - 1;
+        for (int gi = 0; gi < 2; gi++) {
+            const int lo = gi ? n1 : 0, n = gi ? n2 : n1;
+            for (int e = 0; e < (int) v.size(); e++) v[e] = (e >= lo && e < lo + n) ? (float) (e - lo) : (float) n;
+            ggml_backend_tensor_set(g_tm.m[il][gi], v.data(), 0, v.size() * sizeof(float));
+        }
+    }
+}
+
+struct ecache_state {
+    const llama_model * model = nullptr;              // the model the state belongs to (re-initialized for another)
+    bool tried = false, on = false, active = false;   // active: the graph about to run computes the cache on the GPU
+    std::vector<std::array<ecache_group, 2>> L;
+    std::unordered_map<const ggml_tensor *, std::pair<int, int>> by_base;   // model tensors and the scheduler's copies
+    std::unordered_map<std::string, std::pair<int, int>> by_name;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    int64_t tokens = 0, swaps_total = 0, uses = 0, hits = 0;
+    int every = 32, max_swaps = 24;
+    gguf_context * gctx = nullptr; int fd = -1; size_t data_off = 0;   // source bytes when the CPU copy is repacked
+    std::vector<uint8_t> tmp;
+};
+ecache_state g_ec;
+
+bool ecache_hook(const ggml_tensor * src0, int32_t e, int64_t n_rows, bool count, void *) {
+    // src0 is a model tensor or a scheduler copy of it (same name). New copies are registered by the counting call,
+    // which runs on one thread before the op's barrier; the skip queries of all threads come after it.
+    auto it = g_ec.by_base.find(src0);
+    if (it == g_ec.by_base.end()) {
+        if (!count) return false;
+        auto nt = g_ec.by_name.find(src0->name);
+        if (nt == g_ec.by_name.end()) return false;
+        it = g_ec.by_base.emplace(src0, nt->second).first;
+    }
+    ecache_group & g = g_ec.L[it->second.first][it->second.second];
+    if (e < 0 || e >= g.n) return false;
+    if (count) {
+        if (strstr(src0->name, "ffn_gate_exps")) {   // gate only: one count per routed slot
+            g.score[e] += (float) n_rows;
+            g_ec.uses += n_rows; if (g.slot_of[e] >= 0) g_ec.hits += n_rows;
+        }
+        return false;
+    }
+    return g_ec.active && g.slot_of[e] >= 0;
+}
+
+size_t ecache_expert_bytes(const ggml_tensor * t) { return ggml_row_size(t->type, t->ne[0]) * t->ne[1]; }
+
+// bytes of expert e of tensor t, read from the model file in the GGUF's own layout (the in-memory copy may be repacked
+// or pinned elsewhere). The file is the .gguf this process maps, or LLAMA_EXPERT_CACHE_MODEL.
+const uint8_t * ecache_src(const ggml_tensor * t, int e) {
+    const size_t nb = ecache_expert_bytes(t);
+    if (!g_ec.gctx) {
+        std::string path = getenv("LLAMA_EXPERT_CACHE_MODEL") ? getenv("LLAMA_EXPERT_CACHE_MODEL") : g_qwen4exp_model_path;
+        std::ifstream maps("/proc/self/maps"); std::string line;
+        while (path.empty() && std::getline(maps, line)) {
+            const size_t p = line.find('/');
+            if (p != std::string::npos && line.size() > 5 && line.compare(line.size() - 5, 5, ".gguf") == 0) path = line.substr(p);
+        }
+        for (int fd = 0; path.empty() && fd < 1024; fd++) {     // or a .gguf this process still has open
+            char link[64], buf[4096];
+            snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+            const ssize_t n = readlink(link, buf, sizeof(buf) - 1);
+            if (n > 5) { buf[n] = 0; if (strcmp(buf + n - 5, ".gguf") == 0) path = buf; }
+        }
+        if (path.empty()) { fprintf(stderr, "%s: model file not found: set LLAMA_EXPERT_CACHE_MODEL\n", __func__); return nullptr; }
+        gguf_init_params ip = { /*no_alloc*/ true, /*ctx*/ nullptr };
+        g_ec.gctx = gguf_init_from_file(path.c_str(), ip);
+        g_ec.fd = open(path.c_str(), O_RDONLY);
+        if (!g_ec.gctx || g_ec.fd < 0) return nullptr;
+        g_ec.data_off = gguf_get_data_offset(g_ec.gctx);
+    }
+    const int64_t ti = gguf_find_tensor(g_ec.gctx, t->name);
+    if (ti < 0) return nullptr;
+    g_ec.tmp.resize(nb);
+    const off_t off = (off_t) (g_ec.data_off + gguf_get_tensor_offset(g_ec.gctx, ti) + (size_t) e * nb);
+    return pread(g_ec.fd, g_ec.tmp.data(), nb, off) == (ssize_t) nb ? g_ec.tmp.data() : nullptr;
+}
+
+bool ecache_load_expert(ecache_group & g, int slot, int e) {
+    for (int r = 0; r < 3; r++) {
+        const uint8_t * src = ecache_src(g.base[r], e);
+        if (!src) return false;
+        ggml_backend_tensor_set(g.cache[r], src, (size_t) slot * g.cache[r]->nb[2], ecache_expert_bytes(g.base[r]));
+    }
+    return true;
+}
+
+void ecache_init(const llama_model & model) {
+    const char * prof = getenv("LLAMA_EXPERT_CACHE");
+    if (!prof) { g_ec.tried = true; return; }
+    for (const auto & l : model.layers) {           // a memory-fit probe model has no weights: wait for the real one
+        if (l.ffn_down_exps_t2 && !l.ffn_down_exps_t2->buffer) return;
+    }
+    if (g_ec.buf) ggml_backend_buffer_free(g_ec.buf);
+    if (g_ec.ctx) ggml_free(g_ec.ctx);
+    if (g_ec.gctx) gguf_free(g_ec.gctx);
+    if (g_ec.fd >= 0) close(g_ec.fd);
+    g_ec = ecache_state();
+    g_ec.model = &model;
+    g_ec.tried = true;
+    const double budget = (getenv("LLAMA_EXPERT_CACHE_MB") ? atof(getenv("LLAMA_EXPERT_CACHE_MB")) : 2048.0) * 1048576.0;
+    if (getenv("LLAMA_EXPERT_CACHE_EVERY")) g_ec.every     = std::max(1, atoi(getenv("LLAMA_EXPERT_CACHE_EVERY")));
+    if (getenv("LLAMA_EXPERT_CACHE_SWAPS")) g_ec.max_swaps = std::max(0, atoi(getenv("LLAMA_EXPERT_CACHE_SWAPS")));
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!gpu || !cpu) { fprintf(stderr, "%s: no GPU or CPU device, expert cache off\n", __func__); return; }
+
+    const int n_layer = (int) model.layers.size();
+    g_ec.L.resize(n_layer);
+    for (int il = 0; il < n_layer; il++) {
+        const auto & l = model.layers[il];
+        if (!l.ffn_down_exps_t2) continue;
+        ggml_tensor * t[2][3] = {{l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps}, {l.ffn_gate_exps_t2, l.ffn_up_exps_t2, l.ffn_down_exps_t2}};
+        int lo = 0;
+        for (int gi = 0; gi < 2; gi++) {
+            ecache_group & g = g_ec.L[il][gi];
+            for (int r = 0; r < 3; r++) g.base[r] = t[gi][r];
+            g.lo = lo; g.n = (int) t[gi][2]->ne[2] - 1; lo += g.n;
+            g.slot_of.assign(g.n, -1); g.score.assign(g.n, 0.0f);
+            for (int r = 0; r < 3; r++) { g_ec.by_base[t[gi][r]] = {il, gi}; g_ec.by_name[t[gi][r]->name] = {il, gi}; }
+        }
+    }
+    // profile: most valuable first = uses per byte; slots per (layer, group) = what fits in the budget
+    struct cand { int il, gi, e; double uses, bytes; };
+    std::vector<cand> cs;
+    std::ifstream f(prof); std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        int il, gr, e; double u;
+        if (sscanf(line.c_str(), "%d %d %d %lf", &il, &gr, &e, &u) != 4) continue;
+        if (il < 0 || il >= n_layer || gr < 1 || gr > 2 || !g_ec.L[il][gr - 1].base[0]) continue;
+        ecache_group & g = g_ec.L[il][gr - 1];
+        if (e < 0 || e >= g.n) continue;
+        const double b = (double) ecache_expert_bytes(g.base[0]) + ecache_expert_bytes(g.base[1]) + ecache_expert_bytes(g.base[2]);
+        cs.push_back({il, gr - 1, e, u, b});
+        g.score[e] = (float) (u * 1e-3);       // a weak prior: runtime counts take over quickly
+    }
+    std::sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.uses / a.bytes > b.uses / b.bytes; });
+    double used = 0;
+    std::vector<cand> pick;
+    for (const cand & c : cs) { if (used + c.bytes > budget) continue; used += c.bytes; pick.push_back(c); }
+    for (const cand & c : pick) g_ec.L[c.il][c.gi].cap++;
+
+    int n_tensors = 0;
+    for (auto & lg : g_ec.L) for (auto & g : lg) if (g.cap > 0) n_tensors += 4;
+    if (n_tensors == 0) { fprintf(stderr, "%s: empty expert cache (budget %.0f MB)\n", __func__, budget / 1048576.0); return; }
+    ggml_init_params ip = { (size_t) n_tensors * ggml_tensor_overhead(), nullptr, true };
+    g_ec.ctx = ggml_init(ip);
+    for (auto & lg : g_ec.L) for (auto & g : lg) {
+        if (g.cap == 0) continue;
+        for (int r = 0; r < 3; r++) {
+            g.cache[r] = ggml_new_tensor_3d(g_ec.ctx, g.base[r]->type, g.base[r]->ne[0], g.base[r]->ne[1], g.cap + 1);
+            g.cache[r]->flags |= GGML_TENSOR_FLAG_ZERO_LAST_EXPERT;
+        }
+        g.map = ggml_new_tensor_2d(g_ec.ctx, GGML_TYPE_F32, 1, model.hparams.n_expert);
+    }
+    g_ec.buf = ggml_backend_alloc_ctx_tensors_from_buft(g_ec.ctx, ggml_backend_dev_buffer_type(gpu));
+    if (!g_ec.buf) { fprintf(stderr, "%s: could not allocate %.0f MB of VRAM, expert cache off\n", __func__, used / 1048576.0); return; }
+    ggml_backend_buffer_set_usage(g_ec.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (auto & lg : g_ec.L) for (auto & g : lg) if (g.cap > 0) g.expert_in.assign(g.cap, -1);
+    for (const cand & c : pick) {
+        ecache_group & g = g_ec.L[c.il][c.gi];
+        int slot = 0; while (g.expert_in[slot] >= 0) slot++;
+        if (!ecache_load_expert(g, slot, c.e)) { fprintf(stderr, "%s: cannot read expert bytes, expert cache off\n", __func__); return; }
+        g.expert_in[slot] = c.e; g.slot_of[c.e] = slot;
+    }
+    for (auto & lg : g_ec.L) for (auto & g : lg) {
+        if (g.cap == 0) continue;
+        for (int r = 0; r < 3; r++) ggml_backend_tensor_memset(g.cache[r], 0, (size_t) g.cap * g.cache[r]->nb[2], g.cache[r]->nb[2]);
+        g.mapv.assign(model.hparams.n_expert, (float) g.cap);
+        for (int e = 0; e < g.n; e++) if (g.slot_of[e] >= 0) g.mapv[g.lo + e] = (float) g.slot_of[e];
+        ggml_backend_tensor_set(g.map, g.mapv.data(), 0, g.mapv.size() * sizeof(float));
+    }
+    auto set_hook = (void (*)(ggml_cpu_mmid_hook_fn, void *)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu), "ggml_cpu_set_mmid_hook");
+    if (!set_hook) { fprintf(stderr, "%s: the CPU backend has no mmid hook, expert cache off\n", __func__); return; }
+    set_hook(ecache_hook, nullptr);
+    for (auto & lg : g_ec.L) for (auto & g : lg) for (int r = 0; r < 3; r++) if (g.base[r]) g.base[r]->flags |= GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP;
+    if (getenv("LLAMA_EC_DBG")) fprintf(stderr, "[ec-init] %s %p flags %d\n", g_ec.L[0][0].base[0]->name, (void *) g_ec.L[0][0].base[0], g_ec.L[0][0].base[0]->flags);
+    g_ec.on = true;
+    fprintf(stderr, "%s: %zu experts (%.0f MB) cached in VRAM from %s; adapting every %d tokens, up to %d swaps\n",
+                   __func__, pick.size(), used / 1048576.0, prof, g_ec.every, g_ec.max_swaps);
+}
+
+// between generated tokens (nothing is computing): swap cold cached experts for hot uncached ones
+void ecache_adapt() {
+    if (!g_ec.on) return;
+    if (++g_ec.tokens % g_ec.every) return;
+    struct sw { float gain; int il, gi, hot, slot; };
+    std::vector<sw> sws;
+    for (int il = 0; il < (int) g_ec.L.size(); il++) for (int gi = 0; gi < 2; gi++) {
+        ecache_group & g = g_ec.L[il][gi];
+        if (g.cap == 0) continue;
+        std::vector<int> hot, cold;
+        for (int e = 0; e < g.n; e++) (g.slot_of[e] >= 0 ? cold : hot).push_back(e);
+        std::sort(hot.begin(),  hot.end(),  [&](int a, int b) { return g.score[a] > g.score[b]; });
+        std::sort(cold.begin(), cold.end(), [&](int a, int b) { return g.score[a] < g.score[b]; });
+        for (size_t i = 0; i < hot.size() && i < cold.size(); i++) {
+            const float h = g.score[hot[i]], c = g.score[cold[i]];
+            if (h < 1.25f * c + 1.0f) break;     // hysteresis: only clearly hotter experts move in
+            sws.push_back({h - c, il, gi, hot[i], g.slot_of[cold[i]]});
+        }
+    }
+    std::sort(sws.begin(), sws.end(), [](const sw & a, const sw & b) { return a.gain > b.gain; });
+    if ((int) sws.size() > g_ec.max_swaps) sws.resize(g_ec.max_swaps);
+    std::vector<ecache_group *> dirty;
+    for (const sw & s : sws) {
+        ecache_group & g = g_ec.L[s.il][s.gi];
+        const int old = g.expert_in[s.slot];
+        if (!ecache_load_expert(g, s.slot, s.hot)) continue;
+        g.slot_of[old] = -1; g.mapv[g.lo + old] = (float) g.cap;
+        g.slot_of[s.hot] = s.slot; g.expert_in[s.slot] = s.hot; g.mapv[g.lo + s.hot] = (float) s.slot;
+        dirty.push_back(&g);
+        g_ec.swaps_total++;
+    }
+    for (ecache_group * g : dirty) ggml_backend_tensor_set(g->map, g->mapv.data(), 0, g->mapv.size() * sizeof(float));
+    for (auto & lg : g_ec.L) for (auto & g : lg) for (float & v : g.score) v *= 0.9f;   // forget slowly
+    if (getenv("LLAMA_EXPERT_CACHE_LOG") && g_ec.tokens % (g_ec.every * 8) == 0) {
+        fprintf(stderr, "%s: %lld tokens, hit rate %.1f%%, %lld swaps so far\n", __func__, (long long) g_ec.tokens,
+                       g_ec.uses ? 100.0 * g_ec.hits / g_ec.uses : 0.0, (long long) g_ec.swaps_total);
+        g_ec.uses = g_ec.hits = 0;
+    }
+}
+} // namespace
+
+// runs ecache_adapt before each single-token step (the previous step's results have been read: nothing in flight)
+class llm_graph_input_ecache : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override {
+        g_ec.active = small && !getenv("LLAMA_EC_NOSKIP");
+        static int dbg = getenv("LLAMA_EC_DBG") ? 0 : 1000; if (dbg < 3) { dbg++; fprintf(stderr, "[ec-input] n_tokens %d small %d\n", (int) ubatch->n_tokens, (int) small); }                    // the CPU skips cached experts only when this graph computes them on the GPU
+        if (small && ubatch->n_tokens == 1) ecache_adapt();
+    }
+    bool can_reuse(const llm_graph_params & params) override { return (params.ubatch.n_tokens < 32) == small; }
+    bool small = true;
+};
+
 // tiered experts (fork): same routing as build_moe_ffn (softmax, top-k over ALL experts, renormalised weights), then
 // one mul_mat_id per group; a slot routed to the other group points at that group's all-zero dummy expert
 ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, const int il) {
@@ -1195,8 +1498,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
     }
     ggml_tensor * self = ggml_cast(ctx0, sel, GGML_TYPE_F32);
     ggml_tensor * x    = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tok);
+    if (!g_ec.tried || g_ec.model != &model) ecache_init(model);
+    if (g_tm.model != &model) tier_maps_init(model);
+    const bool lookup = g_tm.model == &model && !getenv("LLAMA_TIER_ARITH");   // 2 ops per group instead of ~10
+    ggml_tensor * sel_flat0 = lookup ? ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok) : nullptr;
+    const bool use_cache = g_ec.on && n_tok < 32;   // bigger batches: llama.cpp streams all the experts to the GPU anyway
+    if (g_ec.on && il == 0) {
+        auto inp = std::make_unique<llm_graph_input_ecache>();
+        inp->small = use_cache;
+        res->add_input(std::move(inp));
+    }
 
+    auto prod = [&](ggml_tensor * gate, ggml_tensor * up, ggml_tensor * down, ggml_tensor * ids) {
+        ggml_tensor * g = build_lora_mm_id(gate, x, ids, nullptr);
+        ggml_tensor * u = build_lora_mm_id(up,   x, ids, nullptr);
+        return build_lora_mm_id(down, ggml_swiglu_split(ctx0, g, u), ids, nullptr);
+    };
     auto tier = [&](ggml_tensor * gate, ggml_tensor * up, ggml_tensor * down, float lo, int64_t n) {
+        if (lookup) {
+            ggml_tensor * map = g_tm.m[il][lo == 0.0f ? 0 : 1];
+            ggml_tensor * ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, sel_flat0), k, n_tok), GGML_TYPE_I32);
+            ggml_tensor * g = build_lora_mm_id(gate, x, ids, nullptr);
+            ggml_tensor * u = build_lora_mm_id(up,   x, ids, nullptr);
+            return build_lora_mm_id(down, ggml_swiglu_split(ctx0, g, u), ids, nullptr);
+        }
         // m = 1 if lo <= sel < lo + n ; local id = sel - lo inside the group, n (= the zero dummy) outside
         ggml_tensor * m   = ggml_mul(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, self,  1.0f, 0.5f - lo)),
                                            ggml_step(ctx0, ggml_scale_bias(ctx0, self, -1.0f, lo + (float) n - 0.5f)));
@@ -1207,9 +1532,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
         ggml_tensor * u = build_lora_mm_id(up,   x, ids, nullptr);
         return build_lora_mm_id(down, ggml_swiglu_split(ctx0, g, u), ids, nullptr);  // [n_embd, k, n_tok]
     };
-    ggml_tensor * e = ggml_add(ctx0, tier(L.ffn_gate_exps,    L.ffn_up_exps,    L.ffn_down_exps,    0.0f,        n1),
-                                     tier(L.ffn_gate_exps_t2, L.ffn_up_exps_t2, L.ffn_down_exps_t2, (float) n1, n2));
+    const bool lc = use_cache && il < (int) g_ec.L.size() && g_ec.L[il][0].base[0];
+    ggml_tensor * e1 = tier(L.ffn_gate_exps,    L.ffn_up_exps,    L.ffn_down_exps,    0.0f,        n1);
+    ggml_tensor * e2 = tier(L.ffn_gate_exps_t2, L.ffn_up_exps_t2, L.ffn_down_exps_t2, (float) n1, n2);
+    // graph order: both groups' expert products first, so the caller can place the shared expert right after them
+    // (the scheduler then runs it on the GPU while the CPU computes these products: LLAMA_SCHED_OVERLAP)
+    ggml_build_forward_expand(gf, e1);
+    ggml_build_forward_expand(gf, e2);
+    ggml_tensor * e = ggml_add(ctx0, e1, e2);
+    if (lc && !getenv("LLAMA_EC_NOGPU")) {
+        // cached experts on the GPU. They are the FIRST operand of the sum, so graph order puts them (with the shared
+        // expert) at the head of the GPU split that follows the CPU products: launched before the CPU work (overlap)
+        ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok);
+        ggml_tensor * eg = nullptr;
+        for (int gi = 0; gi < 2; gi++) {
+            const ecache_group & g = g_ec.L[il][gi];
+            if (g.cap == 0) continue;
+            ggml_tensor * idg = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, g.map, sel_flat), k, n_tok), GGML_TYPE_I32);
+            ggml_tensor * pg = prod(g.cache[0], g.cache[1], g.cache[2], idg);
+            eg = eg ? ggml_add(ctx0, eg, pg) : pg;
+        }
+        if (eg) e = ggml_add(ctx0, eg, e);
+    }
     e = ggml_mul(ctx0, e, ggml_reshape_3d(ctx0, w, 1, k, n_tok));
+    if (!getenv("LLAMA_TIER_ADDCHAIN")) {   // sum over the k slots in one reduction instead of k-1 adds
+        ggml_tensor * t = ggml_cont(ctx0, ggml_permute(ctx0, e, 1, 0, 2, 3));      // [k, n_embd, n_tok]
+        return ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, t), n_embd, n_tok);
+    }
     ggml_tensor * out = ggml_view_2d(ctx0, e, n_embd, n_tok, e->nb[2], 0);
     for (int64_t i = 1; i < k; ++i) {
         out = ggml_add(ctx0, out, ggml_view_2d(ctx0, e, n_embd, n_tok, e->nb[2], i*e->nb[1]));
@@ -1257,6 +1606,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
+        ggml_build_forward_expand(gf, ffn_shexp);  // before the routed experts' combination (see build_moe_tiered)
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

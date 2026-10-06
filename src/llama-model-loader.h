@@ -118,6 +118,7 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::string fname_main;   // (fork) path of the first model file
     llama_ftype ftype;
     llama_fver  fver;
 

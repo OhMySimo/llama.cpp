@@ -20,6 +20,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
+#include <unordered_set>
+#include <string>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -1799,15 +1803,57 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// LLAMA_SPLIT_PROF=1: per-graph wall time of each backend's splits (input copies + compute, synchronized after
+// each split, so overlap is removed while profiling), printed every 32 graphs. Off: no change at all.
+struct sched_prof_acc { double copy_ms = 0, comp_ms = 0; int64_t n = 0; };
+static bool sched_prof_on() { static int on = -1; if (on < 0) { const char * e = getenv("LLAMA_SPLIT_PROF"); on = e && atoi(e) > 0; } return on; }
+static double sched_now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+// LLAMA_SCHED_OVERLAP=1 (fork): while a CPU split computes, the next GPU split's leading nodes that do not depend on any
+// of its inputs from other backends (e.g. the shared expert, which needs only data already on the GPU) are launched
+// first, so the GPU works in parallel with the CPU. Same nodes, same order on each backend: results are unchanged.
+static bool sched_overlap_on() { static int on = -1; if (on < 0) { const char * e = getenv("LLAMA_SCHED_OVERLAP"); on = e && atoi(e) > 0; } return on; }
+
+static int sched_independent_prefix(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+    std::unordered_set<const ggml_tensor *> late;
+    for (int i = 0; i < split->n_inputs; i++) {
+        late.insert(tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy));
+    }
+    auto depends = [&](const ggml_tensor * t) {
+        for (int k = 0; k < GGML_MAX_SRC && t; k++) {
+            for (const ggml_tensor * s = t->src[k]; s; s = s->view_src) {
+                if (late.count(s)) return true;
+            }
+        }
+        for (const ggml_tensor * v = t ? t->view_src : nullptr; v; v = v->view_src) {
+            if (late.count(v)) return true;
+        }
+        return false;
+    };
+    int n = 0;
+    for (; n < split->graph.n_nodes; n++) {
+        ggml_tensor * node = split->graph.nodes[n];
+        if (depends(node)) break;
+    }
+    return n;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    static sched_prof_acc prof_acc[GGML_SCHED_MAX_BACKENDS];
+    static int64_t prof_graphs = 0;
+    static double prof_total = 0;
+    const bool prof = sched_prof_on();
+    const double prof_t0 = prof ? sched_now_ms() : 0;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
+    int launched_prefix_split = -1, launched_prefix_len = 0;
+    const bool overlap = sched_overlap_on() && !sched->callback_eval;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1824,6 +1870,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const double prof_tc = prof ? sched_now_ms() : 0;
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1951,11 +1998,84 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (overlap && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU && split_id + 1 < sched->n_splits) {
+            struct ggml_backend_sched_split * nxt = &splits[split_id + 1];
+            ggml_backend_t nb = sched->backends[nxt->backend_id];
+            if (ggml_backend_dev_type(ggml_backend_get_device(nb)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                const int p = sched_independent_prefix(sched, nxt);
+                static bool dbg_map = getenv("LLAMA_SCHED_OVERLAP_DBG") != nullptr;
+                if (dbg_map) {
+                    dbg_map = false;
+                    for (int si = 0; si < 8 && si < sched->n_splits; si++) {
+                        struct ggml_backend_sched_split * sp = &splits[si];
+                        fprintf(stderr, "[split-map] %d %s n=%d:", si, ggml_backend_name(sched->backends[sp->backend_id]), sp->graph.n_nodes);
+                        for (int q = 0; q < sp->graph.n_nodes; q++) {
+                            const char * nm = sp->graph.nodes[q]->name;
+                            if (strstr(nm, "shexp") || strstr(nm, "shared") || strstr(nm, "moe") || q < 2 || q >= sp->graph.n_nodes - 2) fprintf(stderr, " [%d]%s", q, nm);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+                static int dbg_left = getenv("LLAMA_SCHED_OVERLAP_DBG") ? 12 : 0;
+                if (dbg_left > 0) {
+                    dbg_left--;
+                    fprintf(stderr, "[overlap] split %d -> next %d: prefix %d of %d nodes:", split_id, split_id + 1, p, nxt->graph.n_nodes);
+                    for (int q = 0; q < nxt->graph.n_nodes && q < p + 3; q++) fprintf(stderr, " %s%s(%s)", q == p ? "|| " : "", ggml_op_desc(nxt->graph.nodes[q]), nxt->graph.nodes[q]->name);
+                    fprintf(stderr, "\n");
+                }
+                if (p > 0) {
+                    struct ggml_cgraph gv = ggml_graph_view(&nxt->graph, 0, p);
+                    enum ggml_status ec = ggml_backend_graph_compute_async(nb, &gv);
+                    if (ec != GGML_STATUS_SUCCESS) return ec;
+                    launched_prefix_split = split_id + 1;
+                    launched_prefix_len   = p;
+                }
+            }
+        }
+        struct ggml_cgraph split_graph_rest = split->graph;
+        if (launched_prefix_split == split_id) {
+            split_graph_rest = ggml_graph_view(&split->graph, launched_prefix_len, split->graph.n_nodes);
+            launched_prefix_split = -1;
+        }
+
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            double prof_tk = 0;
+            if (prof) { ggml_backend_synchronize(split_backend); prof_tk = sched_now_ms(); prof_acc[split_backend_id].copy_ms += prof_tk - prof_tc; }
+            static int prof_level = -1;
+            if (prof_level < 0) { const char * e = getenv("LLAMA_SPLIT_PROF"); prof_level = e ? atoi(e) : 0; }
+            if (prof_level >= 2) {  // node by node, synchronized: time per op type (and backend)
+                static std::map<std::string, std::pair<double, int64_t>> by_op;
+                static int64_t prof_nodes_graphs = 0;
+                for (int j = 0; j < split->graph.n_nodes; j++) {
+                    ggml_tensor * t = split->graph.nodes[j];
+                    struct ggml_cgraph gv = ggml_graph_view(&split->graph, j, j + 1);
+                    const double t0 = sched_now_ms();
+                    enum ggml_status ec1 = ggml_backend_graph_compute_async(split_backend, &gv);
+                    if (ec1 != GGML_STATUS_SUCCESS) return ec1;
+                    ggml_backend_synchronize(split_backend);
+                    std::string key = std::string(ggml_backend_name(split_backend)) + " " + ggml_op_desc(t);
+                    if (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) key += std::string(" ") + ggml_type_name(t->src[0]->type);
+                    auto & e = by_op[key]; e.first += sched_now_ms() - t0; e.second++;
+                }
+                prof_acc[split_backend_id].comp_ms += sched_now_ms() - prof_tk; prof_acc[split_backend_id].n++;
+                if (split_id == sched->n_splits - 1 && ++prof_nodes_graphs % 32 == 0) {
+                    std::vector<std::pair<double, std::string>> v;
+                    for (auto & kv : by_op) v.push_back({kv.second.first / 32, kv.first + " x" + std::to_string(kv.second.second / 32)});
+                    std::sort(v.rbegin(), v.rend());
+                    for (size_t i = 0; i < v.size() && i < 25; i++) fprintf(stderr, "[op-prof] %8.2f ms  %s\n", v[i].first, v[i].second.c_str());
+                    by_op.clear();
+                }
+                goto prof_done;
+            }
+            {
+            enum ggml_status ec = split_graph_rest.n_nodes > 0 ? ggml_backend_graph_compute_async(split_backend, &split_graph_rest)
+                                                               : GGML_STATUS_SUCCESS;
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            }
+            if (prof) { ggml_backend_synchronize(split_backend); prof_acc[split_backend_id].comp_ms += sched_now_ms() - prof_tk; prof_acc[split_backend_id].n++; }
+            prof_done:;
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -1998,6 +2118,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (prof) {
+        prof_total += sched_now_ms() - prof_t0;
+        if (++prof_graphs % 32 == 0) {
+            fprintf(stderr, "[split-prof] %lld graphs, %d splits/graph, total %.2f ms/graph:", (long long) prof_graphs,
+                    sched->n_splits, prof_total / 32);
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (prof_acc[b].n == 0) continue;
+                fprintf(stderr, " | %s: copy+wait %.2f compute %.2f ms (%lld splits)", ggml_backend_name(sched->backends[b]),
+                        prof_acc[b].copy_ms / 32, prof_acc[b].comp_ms / 32, (long long) (prof_acc[b].n / 32));
+                prof_acc[b] = sched_prof_acc();
+            }
+            fprintf(stderr, "\n");
+            prof_total = 0;
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 

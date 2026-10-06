@@ -1480,6 +1480,14 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// (fork) see ggml_cpu_set_mmid_hook
+ggml_cpu_mmid_hook_t ggml_cpu_mmid_hook = NULL;
+void * ggml_cpu_mmid_hook_ud = NULL;
+void ggml_cpu_set_mmid_hook(ggml_cpu_mmid_hook_t hook, void * user_data) {
+    ggml_cpu_mmid_hook_ud = user_data;
+    ggml_cpu_mmid_hook    = hook;
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1643,6 +1651,19 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    if (ith == 0 && (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT) && getenv("LLAMA_EXPERT_STATS")) {
+        // (fork) usage counts per expert tensor: appended to $LLAMA_EXPERT_STATS as "name expert count" at exit
+        static FILE * f = NULL; if (!f) f = fopen(getenv("LLAMA_EXPERT_STATS"), "a");
+        if (f && strstr(src0->name, "gate")) {
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) for (int id = 0; id < n_ids; ++id) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                if (e != n_as - 1) fprintf(f, "%s %d\n", src0->name, e);
+            }
+        }
+    }
+    if (ith == 0 && getenv("LLAMA_EC_DBG")) {
+        static int d = 0; if (d < 4) { d++; fprintf(stderr, "[cpu-mmid] %s %p flags %d hook %p\n", src0->name, (void *) src0, src0->flags, (void *) ggml_cpu_mmid_hook); }
+    }
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1656,6 +1677,13 @@ static void ggml_compute_forward_mul_mat_id(
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+        if ((src0->flags & GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP) && ggml_cpu_mmid_hook) {
+            for (int a = 0; a < n_as; a++) {
+                if (matrix_row_counts[a] > 0 && !(a == n_as - 1 && (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT))) {
+                    ggml_cpu_mmid_hook(src0, a, matrix_row_counts[a], true, ggml_cpu_mmid_hook_ud);
+                }
             }
         }
     }
@@ -1672,6 +1700,17 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+
+        // (fork) tiered experts: the last expert is an all-zero dummy -> its rows are zero, nothing to multiply
+        if ((cur_a == n_as - 1 && (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT)) ||
+            ((src0->flags & GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP) && ggml_cpu_mmid_hook &&
+             ggml_cpu_mmid_hook(src0, cur_a, cne1, false, ggml_cpu_mmid_hook_ud))) {
+            for (int64_t r = ith; r < cne1; r += nth) {
+                const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, r);
+                memset((char *) dst->data + rm.i1*dst->nb[1] + rm.i2*dst->nb[2], 0, ne0*sizeof(float));
+            }
             continue;
         }
 

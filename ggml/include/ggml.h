@@ -665,6 +665,8 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_ZERO_LAST_EXPERT = 32, // (fork) MUL_MAT_ID weights whose last expert is all zeros: skip it, write zeros
+        GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP = 64, // (fork) MUL_MAT_ID weights: ask the CPU mmid hook which experts another backend computes
     };
 
     enum ggml_tri_type {
