@@ -733,3 +733,38 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// fork: scale -> unary -> [scale] in one kernel. Each stage is the same float expression as its own kernel
+// (scale_f32, op_silu / op_sigmoid), evaluated in registers: results identical to the unfused ops.
+template <float (*op)(float), bool post>
+static __global__ void scale_unary_scale_f32(const float * x, float * dst, const float s1, const float b1, const float s2, const float b2, const int k) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    float y = s1 * x[i] + b1;
+    y = op(y);
+    if (post) {
+        y = s2 * y + b2;
+    }
+    dst[i] = y;
+}
+
+void ggml_cuda_op_scale_unary_scale(ggml_backend_cuda_context & ctx, ggml_tensor * scale, ggml_tensor * unary, ggml_tensor * scale2) {
+    const ggml_tensor * dst = scale2 ? scale2 : unary;
+    const float s1 = ggml_get_op_params_f32(scale, 0), b1 = ggml_get_op_params_f32(scale, 1);
+    const float s2 = scale2 ? ggml_get_op_params_f32(scale2, 0) : 1.0f, b2 = scale2 ? ggml_get_op_params_f32(scale2, 1) : 0.0f;
+    const int k = ggml_nelements(dst);
+    const int nb = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const float * x = (const float *) scale->src[0]->data;
+    float * d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+    const bool silu = ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU;
+    if (silu) {
+        if (scale2) scale_unary_scale_f32<op_silu, true><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, d, s1, b1, s2, b2, k);
+        else        scale_unary_scale_f32<op_silu, false><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, d, s1, b1, s2, b2, k);
+    } else {
+        if (scale2) scale_unary_scale_f32<op_sigmoid, true><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, d, s1, b1, s2, b2, k);
+        else        scale_unary_scale_f32<op_sigmoid, false><<<nb, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, d, s1, b1, s2, b2, k);
+    }
+}

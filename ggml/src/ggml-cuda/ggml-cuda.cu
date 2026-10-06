@@ -364,6 +364,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
 
 #endif  // defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP)
+        // (fork) LLAMA_GPU_SPIN=1: the host spins on synchronize instead of sleeping (lower wake-up latency on the many
+        // GPU<->CPU hand-offs of hybrid MoE inference; costs one busy CPU core while waiting)
+        if (getenv("LLAMA_GPU_SPIN")) {
+            CUDA_CHECK(hipSetDevice(physical_id));
+            CUDA_CHECK(hipSetDeviceFlags(hipDeviceScheduleSpin));
+        }
+#endif
     }
 
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
@@ -4201,6 +4209,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // fork: scale -> silu|sigmoid [-> scale], f32 contiguous (hyper-connection gates): one kernel, same arithmetic
+    if (node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) && i + 1 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_UNARY && cgraph->nodes[i + 1]->type == GGML_TYPE_F32 && ggml_is_contiguous(cgraph->nodes[i + 1]) &&
+        (ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU || ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID)) {
+        static const bool off = getenv("LLAMA_NO_SCALE_FUSE") != nullptr;
+        if (!off && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }) && ggml_is_contiguous(cgraph->nodes[i + 2])) {
+            ggml_cuda_op_scale_unary_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
+        if (!off && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+            ggml_cuda_op_scale_unary_scale(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr);
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
@@ -4407,12 +4431,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             auto & e = acc[kp_key[q]]; e.first += ms; e.second++;
                         }
                         kp_n = 0;
-                        if (++calls % (49 * 32) == 0) {
+                        static long toks = 0; ++calls;
+                        if (strcmp(cgraph->nodes[cgraph->n_nodes - 1]->name, "result_output") == 0 && ++toks % 32 == 0) {
                             std::vector<std::pair<double, std::string>> v; double tot = 0;
+                            fprintf(stderr, "[kernel-prof] %ld graph calls per token\n", calls / 32); calls = 0;
                             for (auto & kv : acc) { v.push_back({kv.second.first / 32, kv.first + " x" + std::to_string(kv.second.second / 32)}); tot += kv.second.first / 32; }
                             std::sort(v.rbegin(), v.rend());
                             fprintf(stderr, "[kernel-prof] GPU kernel time per token %.2f ms\n", tot);
-                            for (size_t q = 0; q < v.size() && q < 22; q++) fprintf(stderr, "[kernel-prof] %7.3f ms  %s\n", v[q].first, v[q].second.c_str());
+                            for (size_t q = 0; q < v.size() && q < 60; q++) fprintf(stderr, "[kernel-prof] %7.3f ms  %s\n", v[q].first, v[q].second.c_str());
                             acc.clear();
                         }
                     }
@@ -4549,7 +4575,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // LLAMA_GPU_SPLIT_PROF=1 (fork): GPU-side duration of each graph_compute call (events, graphs on), vs the
+    // kernels' own time: the difference is launch/inter-kernel overhead. Printed per 49 calls (one token).
+    static const bool sprof = getenv("LLAMA_GPU_SPLIT_PROF") != nullptr;
+    static std::vector<std::pair<cudaEvent_t, cudaEvent_t>> sp_ev; static size_t sp_n = 0; static long sp_calls = 0;
+    static std::vector<int> sp_nodes;
+    {   // LLAMA_DUMP_GPU_GRAPH=N (fork): print the nodes of the N-th graph_compute call once
+        static long dump_at = getenv("LLAMA_DUMP_GPU_GRAPH") ? atol(getenv("LLAMA_DUMP_GPU_GRAPH")) : -1; static long dump_n = 0;
+        if (dump_at >= 0 && dump_n++ >= dump_at && dump_n <= dump_at + 4) {
+            for (int q = 0; q < cgraph->n_nodes; q++) { ggml_tensor * t = cgraph->nodes[q];
+                fprintf(stderr, "[gdump %ld] %3d %-14s %-28s [%lld,%lld,%lld] %s <- %s, %s\n", dump_n, q, ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], ggml_type_name(t->type),
+                        t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-"); }
+        }
+    }
+    const bool sp_on = sprof && !(use_cuda_graph && cuda_graph_update_required);   // no event record inside a capture
+    if (sp_on) {
+        if (sp_n >= sp_ev.size()) { cudaEvent_t a_, b_; CUDA_CHECK(cudaEventCreateWithFlags(&a_, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&b_, 0)); sp_ev.push_back({a_, b_}); sp_nodes.push_back(0); }
+        CUDA_CHECK(cudaEventRecord(sp_ev[sp_n].first, cuda_ctx->stream()));
+    }
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (sp_on) {
+        CUDA_CHECK(cudaEventRecord(sp_ev[sp_n].second, cuda_ctx->stream()));
+        sp_nodes[sp_n] = cgraph->n_nodes; sp_n++;
+        if (strcmp(cgraph->nodes[cgraph->n_nodes - 1]->name, "result_output") == 0 && ++sp_calls % 16 == 0) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            double tot = 0; long nodes = 0;
+            for (size_t q = 0; q < sp_n; q++) { float ms = 0; CUDA_CHECK(hipEventElapsedTime(&ms, sp_ev[q].first, sp_ev[q].second)); tot += ms; nodes += sp_nodes[q]; }
+            fprintf(stderr, "[gpu-split-prof] per token: GPU busy %.2f ms over %ld graph nodes (graphs %s)\n", tot / 16, nodes / 16, use_cuda_graph ? "on" : "off");
+            sp_n = 0;
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }

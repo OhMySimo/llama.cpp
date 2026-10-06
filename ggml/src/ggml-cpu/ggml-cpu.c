@@ -1481,6 +1481,7 @@ struct mmid_row_mapping {
 };
 
 // (fork) see ggml_cpu_set_mmid_hook
+void ggml_cpu_pf_record(const struct ggml_tensor * src0, const int64_t * counts, int n_as, bool zero_last);
 ggml_cpu_mmid_hook_t ggml_cpu_mmid_hook = NULL;
 void * ggml_cpu_mmid_hook_ud = NULL;
 void ggml_cpu_set_mmid_hook(ggml_cpu_mmid_hook_t hook, void * user_data) {
@@ -1679,6 +1680,7 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+        if (ids->ne[1] == 1) ggml_cpu_pf_record(src0, matrix_row_counts, n_as, (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT) != 0);
         if ((src0->flags & GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP) && ggml_cpu_mmid_hook) {
             for (int a = 0; a < n_as; a++) {
                 if (matrix_row_counts[a] > 0 && !(a == n_as - 1 && (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT))) {
@@ -1696,6 +1698,11 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // LLAMA_MMID_PROF=1 (fork): per thread, rows computed and time from the post-grouping barrier to done
+    static int mprof = -1; if (mprof < 0) mprof = getenv("LLAMA_MMID_PROF") ? 1 : 0;
+    static int64_t mp_rows[64], mp_us[64], mp_start[64]; static int64_t mp_calls = 0;
+    const int64_t mp_t0 = mprof ? ggml_time_us() : 0;
+    int64_t mp_r = 0;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1737,7 +1744,15 @@ static void ggml_compute_forward_mul_mat_id(
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+        // (fork) LLAMA_MMID_CHUNK=<rows> (default 0 = off): few-token calls are split into small row chunks taken
+        // dynamically, so slower cores (E-cores) take fewer of them; the default split gives every thread one equal
+        // slice. Each row's dot products are unchanged: results identical. 0 restores the default split.
+        static int mmid_chunk = -1;
+        if (mmid_chunk < 0) { const char * e = getenv("LLAMA_MMID_CHUNK"); mmid_chunk = e ? atoi(e) : 0; }
+        if (mmid_chunk > 0 && nr1 <= 4 && !disable_chunking) {
+            nchunk0 = (nr0 + mmid_chunk - 1) / mmid_chunk;
+            nchunk1 = 1;
+        } else if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
             nchunk0 = nr0 > nr1 ? nth : 1;
             nchunk1 = nr0 > nr1 ? 1 : nth;
         }
@@ -1764,12 +1779,21 @@ static void ggml_compute_forward_mul_mat_id(
                 ir0_start, ir0_end, ir1_start, ir1_end,
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
+            mp_r += ir0_end - ir0_start;
 
             if (nth >= nchunk0 * nchunk1) {
                 break;
             }
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+    if (mprof && ith < 64 && ids->ne[1] == 1) {
+        mp_rows[ith] += mp_r; mp_us[ith] += ggml_time_us() - mp_t0;
+        if (ith == 0 && ++mp_calls % 2880 == 0) {
+            fprintf(stderr, "[mmid-prof] per op (avg of 2880): rows/us by thread:");
+            for (int t = 0; t < nth && t < 64; t++) { fprintf(stderr, " %lld/%lld", (long long) (mp_rows[t] / 2880), (long long) (mp_us[t] / 2880)); mp_rows[t] = mp_us[t] = 0; }
+            fprintf(stderr, "\n");
         }
     }
 }
@@ -3179,12 +3203,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        // LLAMA_CPU_PROF=1 (fork): thread 0 splits each op's time into compute and wait-at-barrier
+        static int cprof = -1; if (cprof < 0) cprof = getenv("LLAMA_CPU_PROF") ? 1 : 0;
+        int64_t cp_t0 = (cprof && state->ith == 0) ? ggml_time_us() : 0;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
         }
+        int64_t cp_t1 = (cprof && state->ith == 0) ? ggml_time_us() : 0;
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3194,6 +3222,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+        if (cprof && state->ith == 0) {
+            static int64_t comp[GGML_OP_COUNT], wait_[GGML_OP_COUNT], cnt[GGML_OP_COUNT], graphs = 0;
+            const int64_t cp_t2 = ggml_time_us();
+            comp[node->op] += cp_t1 - cp_t0; wait_[node->op] += cp_t2 - cp_t1; cnt[node->op]++;
+            if (node_n + 1 >= cgraph->n_nodes && ++graphs % (48 * 32) == 0) {
+                double tc = 0, tw = 0;
+                for (int o = 0; o < GGML_OP_COUNT; o++) { tc += comp[o]; tw += wait_[o]; }
+                fprintf(stderr, "[cpu-prof] per token: compute %.2f ms, barrier wait %.2f ms\n", tc / 32e3, tw / 32e3);
+                for (int o = 0; o < GGML_OP_COUNT; o++) if (cnt[o]) {
+                    fprintf(stderr, "[cpu-prof]   %-14s x%-4lld compute %.2f ms  wait %.2f ms\n", ggml_op_name((enum ggml_op) o),
+                            (long long) (cnt[o] / 32), comp[o] / 32e3, wait_[o] / 32e3);
+                    comp[o] = wait_[o] = cnt[o] = 0;
+                }
+            }
         }
     }
 
@@ -3244,6 +3287,96 @@ static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * st
     UNUSED(state);
 }
 
+// (fork) LLAMA_EXPERT_PREFETCH=<threads>@<first cpu>, e.g. 8@16: while the CPU backend waits for the GPU, helper
+// threads read into the cache the experts that the NEXT CPU split's matrices used at the previous token (about half
+// are used again). Reads only: results are unchanged. Decode only (one token per call).
+#include <pthread.h>
+#include <sched.h>
+#define PF_MAX_ENT 1024
+#define PF_MAX_CHUNK 16384
+#define PF_CHUNK (64*1024)
+struct pf_ent { const char * data; size_t nb2; int n; int32_t e[64]; };
+static struct pf_ent pf_tab[PF_MAX_ENT];
+static int pf_n_ent = 0, pf_last = -1;
+static struct { const char * p; size_t n; } pf_chunk[PF_MAX_CHUNK];
+static atomic_int pf_qn, pf_next, pf_busy;
+static int pf_on = -1, pf_k = 6, pf_min_ith = 2;   // workers 0-1 share the core that launches GPU work
+static volatile uint64_t pf_sink;
+
+static void * pf_worker(void * arg) {
+    const int cpu = (int) (intptr_t) arg;
+    if (cpu >= 0) { cpu_set_t m; CPU_ZERO(&m); CPU_SET(cpu, &m); pthread_setaffinity_np(pthread_self(), sizeof(m), &m); }
+    uint64_t acc = 0;
+    for (;;) {
+        if (atomic_load_explicit(&pf_busy, memory_order_relaxed) ||
+            atomic_load_explicit(&pf_next, memory_order_relaxed) >= atomic_load_explicit(&pf_qn, memory_order_acquire)) {
+            struct timespec ts = {0, 10000}; nanosleep(&ts, NULL);
+            continue;
+        }
+        const int i = atomic_fetch_add(&pf_next, 1);
+        if (i >= atomic_load_explicit(&pf_qn, memory_order_acquire) || i >= PF_MAX_CHUNK) continue;
+        const char * q = pf_chunk[i].p; const size_t n = pf_chunk[i].n;
+        for (size_t o = 0; o < n; o += 64) acc += *(const volatile uint8_t *) (q + o);
+    }
+    pf_sink = acc;
+    return NULL;
+}
+
+// one prefetch chunk, from the thread pool's idle polling loop (LLAMA_EXPERT_PREFETCH=pool)
+static void pf_step(void) {
+    if (!ggml_fork_gpu_wait || atomic_load_explicit(&pf_busy, memory_order_relaxed)) return;
+    if (atomic_load_explicit(&pf_next, memory_order_relaxed) >= atomic_load_explicit(&pf_qn, memory_order_acquire)) return;
+    const int i = atomic_fetch_add(&pf_next, 1);
+    if (i >= atomic_load_explicit(&pf_qn, memory_order_acquire) || i >= PF_MAX_CHUNK) return;
+    const char * q = pf_chunk[i].p; const size_t n = pf_chunk[i].n;
+    uint64_t acc = 0;
+    for (size_t o = 0; o < n; o += 64) acc += *(const volatile uint8_t *) (q + o);
+    pf_sink += acc;
+}
+
+static void pf_init(void) {
+    const char * e = getenv("LLAMA_EXPERT_PREFETCH");
+    pf_on = 0;
+    if (!e) return;
+    int nt = e[0] == 'p' ? 0 : atoi(e), first = -1; const char * at = strchr(e, '@'); if (at) first = atoi(at + 1);
+    if (getenv("LLAMA_EXPERT_PREFETCH_MIN_ITH")) pf_min_ith = atoi(getenv("LLAMA_EXPERT_PREFETCH_MIN_ITH"));
+    if (e[0] == 'p') { pf_on = 2; fprintf(stderr, "[prefetch] by the thread pool while idle\n"); return; }
+    if (getenv("LLAMA_EXPERT_PREFETCH_K")) pf_k = atoi(getenv("LLAMA_EXPERT_PREFETCH_K"));
+    for (int t = 0; t < nt; t++) { pthread_t th; pthread_create(&th, NULL, pf_worker, (void *) (intptr_t) (first >= 0 ? first + t : -1)); pthread_detach(th); }
+    pf_on = nt > 0;
+    fprintf(stderr, "[prefetch] %d helper threads from cpu %d, lookahead %d matrices\n", nt, first, pf_k);
+}
+
+// called by thread 0 of mul_mat_id after grouping (decode calls only)
+void ggml_cpu_pf_record(const struct ggml_tensor * src0, const int64_t * counts, int n_as, bool zero_last) {
+    if (pf_on < 0) pf_init();
+    if (!pf_on) return;
+    const char * d = (const char *) src0->data;
+    { static int dbg = 0; if (getenv("LLAMA_PF_DBG") && dbg < 40) { dbg++; fprintf(stderr, "[pf-dbg] %s data %p view_src %s buf %p\n", src0->name, (void *) d, src0->view_src ? src0->view_src->name : "-", (void *) src0->buffer); } }
+    int p = -1;
+    for (int k = 1; k <= pf_n_ent; k++) { const int j = (pf_last + k) % (pf_n_ent ? pf_n_ent : 1); if (pf_tab[j].data == d) { p = j; break; } }
+    if (p < 0) { if (pf_n_ent >= PF_MAX_ENT) return; p = pf_n_ent++; pf_tab[p].data = d; pf_tab[p].nb2 = src0->nb[2]; }
+    if (p == 0 && pf_last >= 0) { static int once = 0; if (!once) { once = 1; fprintf(stderr, "[prefetch] %d expert matrices per token, first: %s\n", pf_n_ent, src0->name); } }
+    pf_last = p;
+    struct pf_ent * en = &pf_tab[p];
+    en->n = 0;
+    for (int a = 0; a < n_as && en->n < 64; a++) if (counts[a] > 0 && !(zero_last && a == n_as - 1)) en->e[en->n++] = a;
+    if (p % pf_k == 0) { atomic_store(&pf_qn, 0); atomic_store(&pf_next, 0); }
+    const int t = p + pf_k;
+    if (t >= pf_n_ent) return;
+    const struct pf_ent * nx = &pf_tab[t];
+    int qn = atomic_load(&pf_qn);
+    for (int x = 0; x < nx->n; x++) {
+        const char * b = nx->data + (size_t) nx->e[x] * nx->nb2;
+        for (size_t o = 0; o < nx->nb2 && qn < PF_MAX_CHUNK; o += PF_CHUNK) {
+            pf_chunk[qn].p = b + o; pf_chunk[qn].n = nx->nb2 - o < PF_CHUNK ? nx->nb2 - o : PF_CHUNK; qn++;
+        }
+    }
+    atomic_store_explicit(&pf_qn, qn, memory_order_release);
+}
+
+void ggml_cpu_pf_busy(int b) { if (pf_on > 0) atomic_store_explicit(&pf_busy, b, memory_order_relaxed); }
+
 static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
@@ -3253,6 +3386,7 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
 
     for (uint64_t i=0; !ggml_graph_compute_thread_ready(state) && i < n_rounds; i++) {
         // No new work. Keep polling.
+        if (pf_on == 2 && state->ith >= pf_min_ith && (i & 15) == 0) { pf_step(); continue; }   // (fork) expert prefetch while idle
         ggml_thread_cpu_relax();
     }
 
@@ -3427,7 +3561,17 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+
+
+static enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    ggml_cpu_pf_busy(1);
+    const enum ggml_status st = ggml_graph_compute_impl(cgraph, cplan);
+    ggml_cpu_pf_busy(0);
+    return st;
+}
+
+static enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
@@ -3455,6 +3599,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    static int gprof = -1; if (gprof < 0) gprof = getenv("LLAMA_CPU_PROF") ? 1 : 0;
+    const int64_t gp_t0 = gprof ? ggml_time_us() : 0;
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3492,6 +3638,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 
+    if (gprof) {   // whole call (thread start + compute + join): the gap to compute+wait is the parallel-region overhead
+        static int64_t tot = 0, calls = 0;
+        tot += ggml_time_us() - gp_t0;
+        if (++calls % (48 * 32) == 0) { fprintf(stderr, "[cpu-prof] per token: whole graph_compute calls %.2f ms (%d threads)\n", tot / 32e3, n_threads); tot = 0; }
+    }
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
 

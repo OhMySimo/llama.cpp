@@ -21,6 +21,10 @@
 extern "C" {
 #endif
 
+    // (fork) 1 while the scheduler only waits for a GPU split (no host work): idle CPU threads may prefetch
+    GGML_API volatile int ggml_fork_gpu_wait;
+
+
     typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
     typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
     typedef struct ggml_backend_event * ggml_backend_event_t;

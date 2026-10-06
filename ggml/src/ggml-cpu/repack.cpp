@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 extern "C" ggml_cpu_mmid_hook_t ggml_cpu_mmid_hook;
+extern "C" void ggml_cpu_pf_record(const struct ggml_tensor * src0, const int64_t * counts, int n_as, bool zero_last);
 extern "C" void * ggml_cpu_mmid_hook_ud;
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
@@ -4863,6 +4864,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     matrix_row_counts[i02] += 1;
                 }
             }
+            if (ids->ne[1] == 1) ggml_cpu_pf_record(src0, matrix_row_counts, n_as, (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT) != 0);
             if ((src0->flags & GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP) && ggml_cpu_mmid_hook) {
                 for (int a = 0; a < n_as; a++) {
                     if (matrix_row_counts[a] > 0 && !(a == n_as - 1 && (src0->flags & GGML_TENSOR_FLAG_ZERO_LAST_EXPERT))) {
