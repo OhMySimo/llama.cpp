@@ -1,0 +1,84 @@
+// (fork) weight prefetch into the Infinity Cache (RDNA2: 96 MB memory-side cache, ~1 TB/s on hits vs ~370 GB/s DRAM).
+// While the CPU computes a layer's experts the GPU is idle once the overlap prefix is done; this kernel, queued right
+// after the prefix, reads the next split's weights in the order they are used so the following kernels find them in
+// the cache. It only loads (results discarded): no computed value changes. It stops as soon as the host signals that
+// the CPU split is done (pinned host flag), so it never delays the next split by more than one chunk.
+
+#include "common.cuh"
+
+#define PF_MAXR 48
+#define PF_NT   256
+
+struct pf_args {
+    const char * p[PF_MAXR];
+    unsigned long long end[PF_MAXR];   // cumulative byte offsets (multiples of 16)
+    int n;
+    unsigned int seq;
+    const volatile unsigned int * stop;
+    int * sink;
+};
+
+static __global__ void __launch_bounds__(PF_NT) pf_kernel(const pf_args a) {
+    __shared__ int quit;
+    const unsigned long long total = a.end[a.n - 1];
+    const unsigned long long chunk = PF_NT * 16 * 4;
+    int4 acc = make_int4(0, 0, 0, 0);
+    int r = 0;
+    for (unsigned long long off = (unsigned long long) blockIdx.x * chunk; off < total; off += (unsigned long long) gridDim.x * chunk) {
+        if (threadIdx.x == 0) {
+            quit = (int) (__hip_atomic_load(a.stop, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) - a.seq) >= 0;
+        }
+        __syncthreads();
+        if (quit) break;
+        while (r < a.n - 1 && off >= a.end[r]) r++;
+        const unsigned long long base = r ? a.end[r - 1] : 0;
+        const unsigned long long lim  = a.end[r];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const unsigned long long o = off + (unsigned long long) (k * PF_NT + threadIdx.x) * 16;
+            if (o < lim) {
+                const int4 v = *(const int4 *) (a.p[r] + (o - base));
+                acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+            }
+        }
+        __syncthreads();
+    }
+    if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x7f3a5c21) a.sink[0] = 1;   // keeps the loads
+}
+
+static unsigned int * g_pf_stop = nullptr;
+static int * g_pf_sink = nullptr;
+static unsigned int g_pf_seq = 0;
+
+// queue a prefetch of the given device ranges on the backend's stream; returns its sequence number
+extern "C" unsigned int ggml_cuda_fork_prefetch(void * backend_ctx, int n, const void * const * ptrs, const size_t * sizes) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend_ctx;
+    if (!g_pf_stop) {
+        CUDA_CHECK(cudaMallocHost((void **) &g_pf_stop, sizeof(unsigned int)));
+        *(volatile unsigned int *) g_pf_stop = 0;
+        CUDA_CHECK(cudaMalloc((void **) &g_pf_sink, sizeof(int)));
+    }
+    pf_args a = {};
+    unsigned long long tot = 0;
+    for (int i = 0; i < n && a.n < PF_MAXR; i++) {
+        const unsigned long long sz = sizes[i] & ~15ull;
+        if (sz == 0) continue;
+        a.p[a.n] = (const char *) ptrs[i];
+        tot += sz;
+        a.end[a.n++] = tot;
+    }
+    const unsigned int seq = ++g_pf_seq;
+    if (a.n == 0) return seq;
+    a.seq  = seq;
+    a.stop = g_pf_stop;
+    a.sink = g_pf_sink;
+    static const int grid = [] { const char * e = getenv("LLAMA_GPU_PREFETCH_GRID"); return e ? atoi(e) : 80; }();
+    pf_kernel<<<grid, PF_NT, 0, ctx->stream()>>>(a);
+    return seq;
+}
+
+// the CPU split is done: running prefetches with a sequence number <= seq stop at their next chunk
+extern "C" void ggml_cuda_fork_prefetch_stop(unsigned int seq) {
+    static const bool nostop = getenv("LLAMA_GPU_PREFETCH_NOSTOP") != nullptr;   // debug: always prefetch everything
+    if (g_pf_stop && !nostop) __atomic_store_n(g_pf_stop, seq, __ATOMIC_RELEASE);
+}

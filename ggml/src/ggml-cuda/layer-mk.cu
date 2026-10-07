@@ -175,9 +175,14 @@ static __device__ void mk_matvec(const mk_stage & s) {
                     if (row0 + r < s.n0 && i0 + u < niter) {
                         const int kbx = kbx0 + (i0 + u)*bpi;
                         int sumi = 0;
+                        static_assert(vdr == 2, "one 8-byte load per lane");
+                        int xv[2];   // the two ints get_int_b2 reads, in one (2-byte aligned) 8-byte load
+                        __builtin_memcpy(xv, (const char *) x[kbx].qs + 4*kqs, 8);
+                        int yv[2];   // the two ints get_int_b4 reads, in one 8-byte load
+                        __builtin_memcpy(yv, (const char *) y[kbx].qs + 4*kqs, 8);
 #pragma unroll
                         for (int v = 0; v < vdr; ++v) {
-                            sumi = ggml_cuda_dp4a(get_int_b2(x[kbx].qs, kqs + v), get_int_b4(y[kbx].qs, kqs + v), sumi);
+                            sumi = ggml_cuda_dp4a(xv[v], yv[v], sumi);
                         }
                         const float d8_0 = x[kbx].d;
                         const float d8_1 = __low2half(y[kbx].ds);

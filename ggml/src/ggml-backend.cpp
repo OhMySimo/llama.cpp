@@ -1840,6 +1840,39 @@ static int sched_independent_prefix(ggml_backend_sched_t sched, struct ggml_back
 
 volatile int ggml_fork_gpu_wait = 0;
 
+// LLAMA_GPU_PREFETCH_MB=<MB> (fork, 0 = off): after the overlap prefix, the GPU reads up to this many bytes of the next
+// split's weights (in use order) while the CPU split computes, so they are in the GPU's last-level cache when needed.
+// Loads only, stopped when the CPU split ends: results unchanged.
+typedef unsigned int (*pf_fn_t)(void *, int, const void * const *, const size_t *);
+typedef void (*pf_stop_fn_t)(unsigned int);
+static pf_stop_fn_t g_pf_stop = nullptr;
+static unsigned int sched_prefetch(ggml_backend_t nb, const struct ggml_backend_sched_split * nxt, int first) {
+    static const size_t budget = [] { const char * e = getenv("LLAMA_GPU_PREFETCH_MB"); return (size_t) (e ? atof(e) : 0) << 20; }();
+    if (budget == 0) return 0;
+    static pf_fn_t fn = nullptr; static bool looked = false;
+    if (!looked) {
+        looked = true;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(nb));
+        fn        = (pf_fn_t)      ggml_backend_reg_get_proc_address(reg, "ggml_cuda_fork_prefetch");
+        g_pf_stop = (pf_stop_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_fork_prefetch_stop");
+    }
+    if (!fn || !g_pf_stop) return 0;
+    const void * ptrs[48]; size_t sizes[48]; int n = 0; size_t tot = 0;
+    for (int i = first; i < nxt->graph.n_nodes && n < 48 && tot < budget; i++) {
+        const ggml_tensor * node = nxt->graph.nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC && n < 48 && tot < budget; k++) {
+            const ggml_tensor * w = node->src[k];
+            if (!w || !w->buffer || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                ggml_backend_buffer_is_host(w->buffer) || ggml_nbytes(w) < 65536) continue;
+            bool dup = false;
+            for (int j = 0; j < n; j++) dup |= ptrs[j] == w->data;
+            if (dup) continue;
+            ptrs[n] = w->data; sizes[n] = std::min(ggml_nbytes(w), budget - tot); tot += sizes[n]; n++;
+        }
+    }
+    return n ? fn(nb->context, n, ptrs, sizes) : 0;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1855,6 +1888,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
     int launched_prefix_split = -1, launched_prefix_len = 0;
+    unsigned int pf_seq = 0;
     const bool overlap = sched_overlap_on() && !sched->callback_eval;
     // fork: batch the activation copies between a GPU and the CPU (async on the GPU stream, one synchronize per split
     // instead of two per tensor); byte copies only, results identical. LLAMA_SCHED_BATCHCPY=0 disables
@@ -2095,6 +2129,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     launched_prefix_split = split_id + 1;
                     launched_prefix_len   = p;
                 }
+                pf_seq = sched_prefetch(nb, nxt, p);
             }
         }
         struct ggml_cgraph split_graph_rest = split->graph;
@@ -2139,6 +2174,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            if (pf_seq) { g_pf_stop(pf_seq); pf_seq = 0; }   // CPU split done: end the GPU prefetch
             }
             if (prof) { ggml_backend_synchronize(split_backend); prof_acc[split_backend_id].comp_ms += sched_now_ms() - prof_tk; prof_acc[split_backend_id].n++; }
             prof_done:;
