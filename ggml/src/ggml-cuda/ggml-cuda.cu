@@ -4243,6 +4243,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // fork: scale -> silu -> q8_0 matrix-vector product (hyper-connection up projection): one kernel, same arithmetic
+    if (node->op == GGML_OP_SCALE && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
+        ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU && cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT &&
+        cgraph->nodes[i + 2]->src[1] == cgraph->nodes[i + 1] && cgraph->nodes[i + 1]->src[0] == node &&
+        ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) && ggml_node_has_n_uses(cgraph, i + 1, 1) &&
+        !(cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) && (cgraph->nodes[i + 2]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        if (ggml_cuda_mmvq_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            return 2;
+        }
+    }
+
     // fork: scale -> silu|sigmoid [-> scale], f32 contiguous (hyper-connection gates): one kernel, same arithmetic
     if (node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node) && i + 1 < cgraph->n_nodes &&
@@ -4474,7 +4485,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             for (auto & kv : acc) { v.push_back({kv.second.first / 32, kv.first + " x" + std::to_string(kv.second.second / 32)}); tot += kv.second.first / 32; }
                             std::sort(v.rbegin(), v.rend());
                             fprintf(stderr, "[kernel-prof] GPU kernel time per token %.2f ms\n", tot);
-                            for (size_t q = 0; q < v.size() && q < 60; q++) fprintf(stderr, "[kernel-prof] %7.3f ms  %s\n", v[q].first, v[q].second.c_str());
+                            for (size_t q = 0; q < v.size() && q < (getenv("LLAMA_KERNEL_PROF_ALL") ? v.size() : 60); q++) fprintf(stderr, "[kernel-prof] %7.3f ms  %s\n", v[q].first, v[q].second.c_str());
                             acc.clear();
                         }
                     }
@@ -4548,6 +4559,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_graph_epoch++;
+    static const bool q8_memo = !getenv("LLAMA_NO_Q8_MEMO");
+    if (q8_memo && !ggml_cuda_q8_memo_buf) {
+        CUDA_CHECK(cudaMalloc(&ggml_cuda_q8_memo_buf, GGML_CUDA_Q8_MEMO_SIZE));
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

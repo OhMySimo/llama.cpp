@@ -1,3 +1,5 @@
+#include <set>
+#include <tuple>
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1166,6 +1168,101 @@ static __global__ void mul_mat_vec_q8_0_multirow(const void * __restrict__ vx, c
     }
 }
 
+// (fork) SCALE -> SILU -> MUL_MAT(q8_0, multirow shape) in one kernel (hyper-connection up projection, K = 320):
+// every block recomputes the SILU input (the expressions of scale_unary_scale_f32) and its q8_1 quantization (those of
+// quantize_q8_1, one wave per 32-value block) in shared memory, then runs the loop of mul_mat_vec_q8_0_multirow<R>.
+// Same values as the three kernels it replaces.
+#define MMVQ_SSM_MAX_BLOCKS 32
+template <int R>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_vec_q8_0_multirow_scale_silu(const void * __restrict__ vx, const float * __restrict__ xin, float * __restrict__ dst,
+        const int blocks_per_row_x, const int stride_row_x, const int nrows_x, const int ne10, const float s1, const float b1) {
+    constexpr int qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ, bpi = vdr*32/qi;
+    __shared__ block_q8_1 ys[MMVQ_SSM_MAX_BLOCKS];
+    const int lane = threadIdx.x;
+    for (int b = threadIdx.y; b < blocks_per_row_x; b += blockDim.y) {
+        const int i = b*QK8_1 + lane;
+        float xi = 0.0f;
+        if (i < ne10) {
+            const float y = s1 * xin[i] + b1;
+            xi = ggml_cuda_op_silu_single(y);
+        }
+        float amax = fabsf(xi);
+        float sum = xi;
+        amax = warp_reduce_max<QK8_1>(amax);
+        sum  = warp_reduce_sum<QK8_1>(sum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+        ys[b].qs[lane] = q;
+        if (lane == 0) {
+            ys[b].ds = make_half2(d, sum);
+        }
+    }
+    __syncthreads();
+    const int row0 = (blockIdx.x*blockDim.y + threadIdx.y)*R;
+    if (row0 >= nrows_x) {
+        return;
+    }
+    const int kqs = vdr * (lane % (qi/vdr));
+    const block_q8_1 * y = ys;
+    float tmp[R] = {0.0f};
+    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += bpi) {
+        const float d8_1 = __low2half(y[kbx].ds);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const block_q8_0 * x = (const block_q8_0 *) vx + (size_t) (row0 + r)*stride_row_x + kbx;
+            int sumi = 0;
+#pragma unroll
+            for (int v = 0; v < vdr; ++v) {
+                sumi = ggml_cuda_dp4a(get_int_b2(x->qs, kqs + v), get_int_b4(y[kbx].qs, kqs + v), sumi);
+            }
+            const float d8_0 = x->d;
+            tmp[r] = __fmaf_rn(d8_0*d8_1, (float) sumi, tmp[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        tmp[r] = warp_reduce_sum<32>(tmp[r]);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            dst[row0 + r] = tmp[r];
+        }
+    }
+}
+
+bool ggml_cuda_mmvq_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * silu, ggml_tensor * mm) {
+    static const bool off = [] { const char * e = getenv("LLAMA_MMVQ_KSPLIT"); return (e && atoi(e) != 1) || getenv("LLAMA_NO_SSM_FUSE") ||
+                                                          getenv("LLAMA_MMVQ_MULTIROW_R") || getenv("LLAMA_MMVQ_MULTIROW_MAXITER") || getenv("LLAMA_MMVQ_KSPLIT_MAXROWS"); }();
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * x    = scale->src[0];
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (off || ggml_cuda_info().devices[device].warp_size != 32 || get_device_table_id(cc) != MMVQ_PARAMETERS_RDNA2 ||
+        src0->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(src0) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        mm->src[1] != silu || ggml_nelements(silu) != src0->ne[0] || mm->type != GGML_TYPE_F32 || ggml_nelements(mm) != src0->ne[1] ||
+        x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != src0->ne[0]) {
+        return false;
+    }
+    const int ncols_x = src0->ne[0], nrows_x = src0->ne[1];
+    const int blocks_per_row_x = ncols_x / QK8_0;
+    const int niter = (blocks_per_row_x + 7) / 8;
+    // the shape for which mul_mat_vec_q8_0_ksplit_try picks the multirow kernel with its defaults (R = 4)
+    if (ncols_x % QK8_0 != 0 || blocks_per_row_x > MMVQ_SSM_MAX_BLOCKS || !(niter <= 3 && nrows_x > 1024 && nrows_x % 16 == 0)) {
+        return false;
+    }
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    const float s1 = ggml_get_op_params_f32(scale, 0), b1 = ggml_get_op_params_f32(scale, 1);
+    const dim3 block(32, 4);
+    mul_mat_vec_q8_0_multirow_scale_silu<4><<<nrows_x/16, block, 0, ctx.stream()>>>(src0->data, (const float *) x->data, (float *) mm->data,
+        blocks_per_row_x, src0->nb[1] / ggml_type_size(src0->type), nrows_x, ncols_x, s1, b1);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // returns true if it handled the product (env LLAMA_MMVQ_KSPLIT: unset/1 = on, 0 = off, 2 = verify against the original)
 static bool mul_mat_vec_q8_0_ksplit_try(const void * vx, const void * vy, float * dst, int ncols_x, int nrows_x, int stride_row_x,
                                         int warp_size, mmvq_parameter_table_id table_id, cudaStream_t stream, bool * verify) {
@@ -1587,6 +1684,18 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+uint64_t ggml_cuda_graph_epoch = 0;
+
+// LLAMA_MMVQ_BENCH: reads a large buffer to evict the weights from the Infinity Cache (clean lines, no write-back)
+static __global__ void mmvq_bench_flush(const int4 * __restrict__ x, size_t n, int * out) {
+    int acc = 0;
+    for (size_t i = blockIdx.x*(size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
+        const int4 v = x[i]; acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x7fffffff) out[0] = acc;   // never true for the zeroed buffer: keeps the loads alive
+}
+void *   ggml_cuda_q8_memo_buf = nullptr;
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1667,13 +1776,33 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    // (fork) single-vector src1 shared by consecutive matmuls of the same graph (e.g. qkv, alpha, beta, z on hc_mixed):
+    // its q8_1 quantization is kept in a persistent buffer and reused. Same input, same deterministic kernel, so the
+    // result is identical; src1 is alive (not overwritten) between two of its consumers. Invalidated per graph_compute.
+    static const ggml_tensor * memo_t = nullptr;
+    static const void * memo_data = nullptr;
+    static uint64_t memo_epoch = 0;
+    static int64_t memo_ne10 = 0;
+    const bool memo = ggml_cuda_q8_memo_buf && ctx.curr_stream_no == 0 && ne11*ne12*ne13 == 1 && q8_1_size <= GGML_CUDA_Q8_MEMO_SIZE;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    char * src1_q = nullptr;
+    if (memo) {
+        src1_q = (char *) ggml_cuda_q8_memo_buf;
+        if (memo_t == src1 && memo_data == src1->data && memo_epoch == ggml_cuda_graph_epoch && memo_ne10 == ne10) {
+            goto quantized;
+        }
+        memo_t = src1; memo_data = src1->data; memo_epoch = ggml_cuda_graph_epoch; memo_ne10 = ne10;
+    } else {
+        src1_q = src1_q8_1.alloc(q8_1_size);
+    }
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
+quantized:
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1697,8 +1826,39 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    // LLAMA_MMVQ_BENCH=1 (fork, with GGML_CUDA_DISABLE_GRAPHS=1): once per shape, time 200 back-to-back launches of the
+    // quantization and of the matrix-vector kernel (true GPU time, without the per-node event overhead)
+    static const bool mbench = getenv("LLAMA_MMVQ_BENCH") != nullptr;
+    if (mbench && !ids && !fusion && ne11 == 1) {
+        static std::set<std::tuple<int, int64_t, int64_t>> seen;
+        if (seen.insert({(int) src0->type, ne00, ne01}).second) {
+            cudaEvent_t e0, e1, e2, e3; CUDA_CHECK(cudaEventCreateWithFlags(&e0, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&e1, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&e2, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&e3, 0));
+            ggml_cuda_pool_alloc<char> qb(ctx.pool(), q8_1_size);
+            static void * flush = nullptr; const size_t fsz = 256u << 20;   // evicts the 96 MB Infinity Cache
+            if (!flush) { CUDA_CHECK(cudaMalloc(&flush, fsz)); CUDA_CHECK(cudaMemset(flush, 0, fsz)); }
+            auto quant = [&] { quantize_row_q8_1_cuda(src1_d, nullptr, qb.get(), src0->type, ne10, src1->nb[1]/ts_src1, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, ne10_padded, ne11, ne12, ne13, stream); };
+            auto mv = [&] { mul_mat_vec_q_switch_type(src0->data, src0->type, qb.get(), ids_d, fusion_local, dst_d, ne00,
+                ne01, ne1, s01, ne10_padded / QK8_1, dst->nb[1] / ts_dst, ne02, ne12, ne2, s02, ne11*(ne10_padded / QK8_1), dst->nb[2] / ts_dst,
+                ne03, ne3, s03, ne12*ne11*(ne10_padded / QK8_1), dst->nb[3] / ts_dst, 0, stream); };
+            for (int r = 0; r < 5; r++) { quant(); mv(); }
+            const int N = 50;
+            CUDA_CHECK(cudaEventRecord(e0, stream));
+            for (int r = 0; r < N; r++) { mmvq_bench_flush<<<1024, 256, 0, stream>>>((const int4 *) flush, fsz/16, (int *) flush); }
+            CUDA_CHECK(cudaEventRecord(e1, stream));
+            for (int r = 0; r < N; r++) { mmvq_bench_flush<<<1024, 256, 0, stream>>>((const int4 *) flush, fsz/16, (int *) flush); quant(); }
+            CUDA_CHECK(cudaEventRecord(e2, stream));
+            for (int r = 0; r < N; r++) { mmvq_bench_flush<<<1024, 256, 0, stream>>>((const int4 *) flush, fsz/16, (int *) flush); mv(); }
+            CUDA_CHECK(cudaEventRecord(e3, stream)); CUDA_CHECK(cudaEventSynchronize(e3));
+            float tf, tq0, tm0; CUDA_CHECK(hipEventElapsedTime(&tf, e0, e1)); CUDA_CHECK(hipEventElapsedTime(&tq0, e1, e2)); CUDA_CHECK(hipEventElapsedTime(&tm0, e2, e3));
+            const float tq = (tq0 - tf)*200/N, tm = (tm0 - tf)*200/N;   // per-launch times below are x/200
+            const double bytes = (double) ggml_nbytes(src0);
+            fprintf(stderr, "[mmvq-bench] %-6s K=%6lld rows=%6lld  quant %6.2f us  matvec %7.2f us  %6.1f GB/s  (%s)\n", ggml_type_name(src0->type),
+                (long long) ne00, (long long) ne01, 1000*tq/200, 1000*tm/200, bytes/(tm/200*1e-3)/1e9, dst->name);
+        }
+    }
+
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

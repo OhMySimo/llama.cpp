@@ -8,6 +8,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
+// (fork) incremented at every graph_compute: scope of the q8_1 input reuse in ggml_cuda_mul_mat_vec_q
+extern uint64_t ggml_cuda_graph_epoch;
+extern void *   ggml_cuda_q8_memo_buf;   // allocated by graph_compute (outside any capture); null: reuse off
+#define GGML_CUDA_Q8_MEMO_SIZE (64*1024)
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
@@ -16,3 +21,6 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// (fork) SCALE -> SILU -> MUL_MAT(q8_0) fused (see mmvq.cu); false if the nodes do not fit, nothing launched
+bool ggml_cuda_mmvq_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * silu, ggml_tensor * mm);
