@@ -1695,6 +1695,18 @@ static __global__ void mmvq_bench_flush(const int4 * __restrict__ x, size_t n, i
     if (acc == 0x7fffffff) out[0] = acc;   // never true for the zeroed buffer: keeps the loads alive
 }
 void *   ggml_cuda_q8_memo_buf = nullptr;
+struct q8_memo { const ggml_tensor * t; const void * data; uint64_t epoch; int64_t ne10; };
+static q8_memo memo_s[2] = {};
+static int memo_next = 0;
+
+void * ggml_cuda_q8_memo_claim(const ggml_tensor * src1, size_t bytes) {
+    if (!ggml_cuda_q8_memo_buf || 2*bytes > GGML_CUDA_Q8_MEMO_SIZE || ggml_nrows(src1) != 1) {
+        return nullptr;
+    }
+    const int m = memo_next; memo_next ^= 1;
+    memo_s[m] = { src1, src1->data, ggml_cuda_graph_epoch, src1->ne[0] };
+    return (char *) ggml_cuda_q8_memo_buf + m*(GGML_CUDA_Q8_MEMO_SIZE/2);
+}
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -1781,9 +1793,6 @@ void ggml_cuda_mul_mat_vec_q(
     // its q8_1 quantization is kept in a persistent buffer and reused. Same input, same deterministic kernel, so the
     // result is identical; src1 is alive (not overwritten) between two of its consumers. Invalidated per graph_compute.
     // two slots (e.g. hc_norm is used by hc_down and, after the q/k/v products on hc_mixed, by hc_inject)
-    struct q8_memo { const ggml_tensor * t; const void * data; uint64_t epoch; int64_t ne10; };
-    static q8_memo memo_s[2] = {};
-    static int memo_next = 0;
     const bool memo = ggml_cuda_q8_memo_buf && ctx.curr_stream_no == 0 && ne11*ne12*ne13 == 1 && 2*q8_1_size <= GGML_CUDA_Q8_MEMO_SIZE;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q = nullptr;

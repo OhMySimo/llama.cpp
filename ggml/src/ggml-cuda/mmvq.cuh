@@ -24,3 +24,7 @@ void ggml_cuda_op_mul_mat_vec_q(
 
 // (fork) SCALE -> SILU -> MUL_MAT(q8_0) fused (see mmvq.cu); false if the nodes do not fit, nothing launched
 bool ggml_cuda_mmvq_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * silu, ggml_tensor * mm);
+
+// (fork) a memo slot for the q8_1 of src1 that the caller writes itself (same layout as quantize_row_q8_1_cuda);
+// later matmuls on src1 in this graph_compute reuse it. nullptr if reuse is off or it does not fit.
+void * ggml_cuda_q8_memo_claim(const ggml_tensor * src1, size_t bytes);

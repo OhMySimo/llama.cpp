@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/hc-chain.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -3541,6 +3542,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    // fork: the whole hyper-connection chain in one persistent kernel
+    if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_RMS_NORM) {
+        const int n = ggml_cuda_try_hc_chain(*cuda_ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
+
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
