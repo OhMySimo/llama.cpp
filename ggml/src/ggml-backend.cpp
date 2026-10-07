@@ -1893,6 +1893,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int prev_backend_id = -1;
     int launched_prefix_split = -1, launched_prefix_len = 0;
     unsigned int pf_seq = 0;
+    ggml_backend_event_t pfx_ev = nullptr;
     const bool overlap = sched_overlap_on() && !sched->callback_eval;
     // fork: batch the activation copies between a GPU and the CPU (async on the GPU stream, one synchronize per split
     // instead of two per tensor); byte copies only, results identical. LLAMA_SCHED_BATCHCPY=0 disables
@@ -2083,22 +2084,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 fprintf(stderr, "\n");
             }
         }
-        const double tl_loop = tl ? sched_now_ms() : 0;
-        if (d2h_backend) {
-            static double t_wait = 0; static long n_wait = 0; const double tw0 = tl ? sched_now_ms() : 0;
-            ggml_fork_gpu_wait = 1;
-            ggml_backend_synchronize(d2h_backend);
-            ggml_fork_gpu_wait = 0;
-            if (tl) { t_wait += sched_now_ms() - tw0; if (++n_wait % (64*48) == 0) { fprintf(stderr, "[d2h-sync] %.2f ms per graph (%ld syncs)\n", t_wait / 64, n_wait / 64); t_wait = 0; n_wait = 0; } }
-            if (h2d_backend == d2h_backend) h2d_backend = nullptr;
-            d2h_backend = nullptr;
-        }
-        if (h2d_backend && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            ggml_backend_synchronize(h2d_backend);
-            h2d_backend = nullptr;
-        }
-
-        const double tl_sync = tl ? sched_now_ms() : 0;
+        auto launch_overlap = [&]() {
         if (overlap && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU && split_id + 1 < sched->n_splits) {
             struct ggml_backend_sched_split * nxt = &splits[split_id + 1];
             ggml_backend_t nb = sched->backends[nxt->backend_id];
@@ -2133,10 +2119,54 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ec != GGML_STATUS_SUCCESS) return ec;
                     launched_prefix_split = split_id + 1;
                     launched_prefix_len   = p;
+                    static const bool pfx_dbg = getenv("LLAMA_PREFIX_PROF") != nullptr;   // (fork) is the prefix critical?
+                    if (pfx_dbg) {
+                        static ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_get_device(nb));
+                        ggml_backend_event_record(ev, nb);
+                        pfx_ev = ev;
+                    }
                 }
                 if (!pf_seq) pf_seq = sched_prefetch(nb, nxt, p, false);
             }
         }
+            return GGML_STATUS_SUCCESS;
+        };
+        // (fork) the GPU work that does not wait for this CPU split (overlap prefix, prefetch) is queued right behind
+        // the device -> host copies, before the host waits for them: the GPU starts it without the host round trip.
+        // The host then waits on an event recorded after the copies instead of on the whole stream.
+        ggml_backend_event_t early_ev = nullptr;
+        bool overlap_done = false;
+        {
+            static const bool early = [] { const char * e = getenv("LLAMA_SCHED_EARLY_PREFIX"); return e && atoi(e) > 0; }();
+            if (early && overlap && d2h_backend && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                split_id + 1 < sched->n_splits && sched->backends[splits[split_id + 1].backend_id] == d2h_backend) {
+                static ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_get_device(d2h_backend));
+                if (ev) {
+                    ggml_backend_event_record(ev, d2h_backend);
+                    early_ev = ev;
+                    const enum ggml_status ec = launch_overlap();
+                    if (ec != GGML_STATUS_SUCCESS) return ec;
+                    overlap_done = true;
+                }
+            }
+        }
+        const double tl_loop = tl ? sched_now_ms() : 0;
+        if (d2h_backend) {
+            static double t_wait = 0; static long n_wait = 0; const double tw0 = tl ? sched_now_ms() : 0;
+            ggml_fork_gpu_wait = 1;
+            if (early_ev) ggml_backend_event_synchronize(early_ev); else ggml_backend_synchronize(d2h_backend);
+            ggml_fork_gpu_wait = 0;
+            if (tl) { t_wait += sched_now_ms() - tw0; if (++n_wait % (64*48) == 0) { fprintf(stderr, "[d2h-sync] %.2f ms per graph (%ld syncs)\n", t_wait / 64, n_wait / 64); t_wait = 0; n_wait = 0; } }
+            if (h2d_backend == d2h_backend) h2d_backend = nullptr;
+            d2h_backend = nullptr;
+        }
+        if (h2d_backend && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_synchronize(h2d_backend);
+            h2d_backend = nullptr;
+        }
+
+        const double tl_sync = tl ? sched_now_ms() : 0;
+        if (!overlap_done) { const enum ggml_status ec = launch_overlap(); if (ec != GGML_STATUS_SUCCESS) return ec; }
         struct ggml_cgraph split_graph_rest = split->graph;
         if (launched_prefix_split == split_id) {
             split_graph_rest = ggml_graph_view(&split->graph, launched_prefix_len, split->graph.n_nodes);
@@ -2180,6 +2210,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return ec;
             }
             if (pf_seq) { g_pf_stop(pf_seq); pf_seq = 0; }   // CPU split done: end the GPU prefetch
+            if (pfx_ev) {   // LLAMA_PREFIX_PROF: host wait for the GPU prefix after the CPU split finished
+                static double tw = 0; static long n = 0, late = 0;
+                const double t0 = sched_now_ms();
+                ggml_backend_event_synchronize(pfx_ev);
+                const double w = sched_now_ms() - t0; tw += w; late += w > 0.005; pfx_ev = nullptr;
+                if (++n % (48*64) == 0) { fprintf(stderr, "[prefix-prof] per token: wait for the GPU prefix after the CPU %.3f ms, %.1f of 48 layers late\n", tw / 64, late / 64.0); tw = 0; late = 0; }
+            }
             }
             if (prof) { ggml_backend_synchronize(split_backend); prof_acc[split_backend_id].comp_ms += sched_now_ms() - prof_tk; prof_acc[split_backend_id].n++; }
             prof_done:;
