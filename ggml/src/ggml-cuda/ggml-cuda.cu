@@ -4580,6 +4580,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         }
 
+        ggml_cuda_cx_side_join();   // (fork) LLAMA_CX_SIDE: rejoin the cached-expert stream
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture

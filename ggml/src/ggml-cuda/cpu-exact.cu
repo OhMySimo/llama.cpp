@@ -530,6 +530,17 @@ static __global__ void cx_block_down(cx_grp g1, cx_grp g2, const char * ids, siz
     if (L == 0) out[row] = r;
 }
 
+static cudaEvent_t  g_cx_join_ev   = nullptr;
+static cudaStream_t g_cx_join_main = nullptr;   // set while side work waits to be joined
+
+// end of a graph evaluation: the main stream waits for the side-stream expert work (inside the capture if any)
+void ggml_cuda_cx_side_join() {
+    if (g_cx_join_main) {
+        CUDA_CHECK(cudaStreamWaitEvent(g_cx_join_main, g_cx_join_ev, 0));
+        g_cx_join_main = nullptr;
+    }
+}
+
 void ggml_cuda_ecache_block_exact(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int32_t cap1 = ggml_get_op_params_i32(dst, 1), cap2 = ggml_get_op_params_i32(dst, 2);
     const ggml_tensor * x = dst->src[1];
@@ -553,22 +564,53 @@ void ggml_cuda_ecache_block_exact(ggml_backend_cuda_context & ctx, ggml_tensor *
     cudaStream_t stream = ctx.stream();
 
     const size_t col_bytes = ggml_row_size(GGML_TYPE_Q8_K, n_embd);
-    ggml_cuda_pool_alloc<char>  qy(ctx.pool(), (size_t) n_tok*col_bytes);
     GGML_ASSERT(n_ff % CX_ROWS_BLOCK == 0 && CX_ROWS_BLOCK == QK8_0);
-    ggml_cuda_pool_alloc<block_q8_0> h(ctx.pool(), (size_t) n_tok*k*(n_ff/QK8_0));
+    // LLAMA_CX_SIDE=1 (fork, decode only): gate/up and down run on a second stream, concurrently with the rest of the
+    // overlap prefix (shared expert, router weights...); the main stream waits for them at the end of this graph
+    // (ggml_cuda_cx_side_join). They read only private copies (q8_K of x, ids), so no later node can overwrite them.
+    static const bool side_on = getenv("LLAMA_CX_SIDE") && atoi(getenv("LLAMA_CX_SIDE")) > 0;
+    const bool side = side_on && n_tok == 1 && ctx.curr_stream_no == 0 && k <= 64;
+    ggml_cuda_pool_alloc<char>  qy_pool;
+    ggml_cuda_pool_alloc<block_q8_0> h_pool;
+    char * qy_p; block_q8_0 * h_p; const char * ids_p = (const char *) ids->data;
+    size_t ids_nb0 = ids->nb[0], ids_nb1 = ids->nb[1];
+    static char * s_qy = nullptr; static block_q8_0 * s_h = nullptr; static int32_t * s_ids = nullptr; static size_t s_qy_n = 0, s_h_n = 0;
+    if (side) {
+        const size_t hn = (size_t) k*(n_ff/QK8_0);
+        if (s_qy_n < col_bytes) { if (s_qy) CUDA_CHECK(cudaFree(s_qy)); CUDA_CHECK(cudaMalloc(&s_qy, col_bytes)); s_qy_n = col_bytes; }
+        if (s_h_n < hn) { if (s_h) CUDA_CHECK(cudaFree(s_h)); CUDA_CHECK(cudaMalloc(&s_h, hn*sizeof(block_q8_0))); s_h_n = hn; }
+        if (!s_ids) CUDA_CHECK(cudaMalloc(&s_ids, 64*sizeof(int32_t)));
+        qy_p = s_qy; h_p = s_h;
+        CUDA_CHECK(cudaMemcpy2DAsync(s_ids, sizeof(int32_t), ids->data, ids->nb[0], sizeof(int32_t), k, cudaMemcpyDeviceToDevice, stream));
+        ids_p = (const char *) s_ids; ids_nb0 = sizeof(int32_t); ids_nb1 = k*sizeof(int32_t);
+    } else {
+        qy_pool.pool = &ctx.pool(); qy_p = qy_pool.alloc((size_t) n_tok*col_bytes);
+        h_pool.pool  = &ctx.pool(); h_p  = h_pool.alloc((size_t) n_tok*k*(n_ff/QK8_0));
+    }
     // LLAMA_CX_BLOCK_PROF=1: GPU time of the three launches, summed per 48 calls (one token)
     static const bool bprof = getenv("LLAMA_CX_BLOCK_PROF") != nullptr;
     static cudaEvent_t ev[4]; static bool ev_init = false; static double acc[3]; static int calls = 0;
     if (bprof && !ev_init) { for (auto & e : ev) CUDA_CHECK(cudaEventCreateWithFlags(&e, 0)); ev_init = true; }
     if (bprof) CUDA_CHECK(cudaEventRecord(ev[0], stream));
-    cx_quantize_q8_K<false><<<dim3(n_embd/QK_K, n_tok), 256, 0, stream>>>((const char *) x->data, x->nb[2], (block_q8_K *) qy.get(), n_embd/QK_K);
+    cx_quantize_q8_K<false><<<dim3(n_embd/QK_K, n_tok), 256, 0, stream>>>((const char *) x->data, x->nb[2], (block_q8_K *) qy_p, n_embd/QK_K);
+    if (side) {
+        static cudaEvent_t fork_ev = nullptr;
+        if (!fork_ev) { CUDA_CHECK(cudaEventCreateWithFlags(&fork_ev, cudaEventDisableTiming)); CUDA_CHECK(cudaEventCreateWithFlags(&g_cx_join_ev, cudaEventDisableTiming)); }
+        CUDA_CHECK(cudaEventRecord(fork_ev, stream));
+        stream = ctx.stream(ctx.device, 1);
+        CUDA_CHECK(cudaStreamWaitEvent(stream, fork_ev, 0));
+    }
     if (bprof) CUDA_CHECK(cudaEventRecord(ev[1], stream));
     cx_block_gateup<<<dim3((n_ff + CX_ROWS_BLOCK - 1)/CX_ROWS_BLOCK, k, n_tok), 8*CX_ROWS_BLOCK, 0, stream>>>(
-        g1, g2, (const char *) ids->data, ids->nb[0], ids->nb[1], qy.get(), col_bytes, n_embd/QK_K, n_ff, k, h.get());
+        g1, g2, ids_p, ids_nb0, ids_nb1, qy_p, col_bytes, n_embd/QK_K, n_ff, k, h_p);
     if (bprof) CUDA_CHECK(cudaEventRecord(ev[2], stream));
     cx_block_down<<<dim3((n_embd + CX_ROWS_BLOCK - 1)/CX_ROWS_BLOCK, k, n_tok), 8*CX_ROWS_BLOCK, 0, stream>>>(
-        g1, g2, (const char *) ids->data, ids->nb[0], ids->nb[1], h.get(), n_ff, n_embd, k, (char *) dst->data, dst->nb[1], dst->nb[2]);
+        g1, g2, ids_p, ids_nb0, ids_nb1, h_p, n_ff, n_embd, k, (char *) dst->data, dst->nb[1], dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());
+    if (side) {
+        CUDA_CHECK(cudaEventRecord(g_cx_join_ev, stream));
+        g_cx_join_main = ctx.stream();
+    }
     if (bprof) {
         CUDA_CHECK(cudaEventRecord(ev[3], stream));
         CUDA_CHECK(cudaEventSynchronize(ev[3]));

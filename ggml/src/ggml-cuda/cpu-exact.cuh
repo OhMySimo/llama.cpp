@@ -20,3 +20,4 @@ bool ggml_cuda_moe_gate_up_swiglu_cpu_exact(ggml_backend_cuda_context & ctx, ggm
 #define GGML_CX_BLOCK_MAGIC 0x45434231   // 'ECB1'
 // the whole cached-expert block of a layer (see cpu-exact.cu)
 void ggml_cuda_ecache_block_exact(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_cx_side_join();   // end of a graph evaluation: join the LLAMA_CX_SIDE stream
