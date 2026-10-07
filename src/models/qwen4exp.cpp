@@ -398,6 +398,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     return mixed;
 }
 
+// (fork) GPU work that does not depend on the CPU expert products, expanded right after them so that the scheduler
+// runs it on the GPU while the CPU computes the experts (LLAMA_SCHED_OVERLAP): the FFN combine weights of the hyper
+// connection, computed early with the same ops (LLAMA_HC_PREFIX=0 disables)
+static ggml_tensor * g_hc_w_pre        = nullptr;
+static ggml_tensor * g_hc_w_pre_inject = nullptr;
+static ggml_tensor * g_ffn_prefix      = nullptr;
+static bool hc_prefix_on() { static const bool on = !getenv("LLAMA_HC_PREFIX") || atoi(getenv("LLAMA_HC_PREFIX")) != 0; return on; }
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         ggml_tensor * residual,
         ggml_tensor * block_out,
@@ -407,8 +415,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
+    ggml_tensor * w;
+    if (g_hc_w_pre && g_hc_w_pre_inject == inject) {
+        w = g_hc_w_pre;
+        g_hc_w_pre = g_hc_w_pre_inject = nullptr;
+    } else {
+        w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx0, w, 2.0f);
+    }
 
     ggml_tensor * cur = nullptr;
     if (cparams.fused_dsv4_hc_post && il >= 0) {
@@ -520,6 +534,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_inject,
                 &inject, il);
 
+        if (hc_prefix_on() && model.layers[il].ffn_down_exps_t2) {
+            g_hc_w_pre = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc)), 2.0f);
+            g_hc_w_pre_inject = inject;
+            g_ffn_prefix = g_hc_w_pre;
+        }
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
@@ -1552,6 +1571,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
     // (the scheduler then runs it on the GPU while the CPU computes these products: LLAMA_SCHED_OVERLAP)
     ggml_build_forward_expand(gf, e1);
     ggml_build_forward_expand(gf, e2);
+    if (hc_prefix_on()) {
+        ggml_build_forward_expand(gf, w);
+        if (g_ffn_prefix) {
+            ggml_build_forward_expand(gf, g_ffn_prefix);
+            g_ffn_prefix = nullptr;
+        }
+    }
     ggml_tensor * e = ggml_add(ctx0, e1, e2);
     if (lc && !getenv("LLAMA_EC_NOGPU")) {
         // cached experts on the GPU. They are the FIRST operand of the sum, so graph order puts them (with the shared
