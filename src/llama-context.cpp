@@ -2655,6 +2655,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
+        // (fork) names ending in "_cpu": small ops the model asks to run on the CPU (LLAMA_CPU_PIN=0 disables)
+        static const bool cpu_pin = !getenv("LLAMA_CPU_PIN") || atoi(getenv("LLAMA_CPU_PIN")) != 0;
+        if (cpu_pin && backend_cpu && strlen(name) > 4 && strcmp(name + strlen(name) - 4, "_cpu") == 0 && ggml_backend_supports_op(backend_cpu, cur)) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+        }
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {

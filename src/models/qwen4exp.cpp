@@ -1254,7 +1254,11 @@ void tier_maps_init(const llama_model & model) {
         if (!model.layers[il].ffn_down_exps_t2) continue;
         for (int gi = 0; gi < 2; gi++) g_tm.m[il][gi] = ggml_new_tensor_2d(g_tm.ctx, GGML_TYPE_F32, 1, model.hparams.n_expert);
     }
-    g_tm.buf = ggml_backend_alloc_ctx_tensors_from_buft(g_tm.ctx, ggml_backend_dev_buffer_type(gpu));
+    // (fork) LLAMA_TIER_MAP_CPU=1 (default): maps in RAM, so the id lookups run on the CPU, inside the expert split:
+    // integer-valued ops, same results on any device, and a few kernels less on the GPU's critical path per layer
+    static const bool map_cpu = !getenv("LLAMA_TIER_MAP_CPU") || atoi(getenv("LLAMA_TIER_MAP_CPU")) != 0;
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    g_tm.buf = ggml_backend_alloc_ctx_tensors_from_buft(g_tm.ctx, ggml_backend_dev_buffer_type(map_cpu && cpu ? cpu : gpu));
     if (!g_tm.buf) { g_tm.model = nullptr; return; }
     ggml_backend_buffer_set_usage(g_tm.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::vector<float> v(model.hparams.n_expert);
@@ -1571,6 +1575,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
     // (the scheduler then runs it on the GPU while the CPU computes these products: LLAMA_SCHED_OVERLAP)
     ggml_build_forward_expand(gf, e1);
     ggml_build_forward_expand(gf, e2);
+    ggml_tensor * e = ggml_add(ctx0, e1, e2);
+    if (n_tok < 32 && !lc) {
+        cb(e, "ffn_moe_e12_cpu", il);   // on the CPU (graph callback): one tensor to send to the GPU instead of two
+        ggml_build_forward_expand(gf, e);
+    }
     if (hc_prefix_on()) {
         ggml_build_forward_expand(gf, w);
         if (g_ffn_prefix) {
@@ -1578,7 +1587,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
             g_ffn_prefix = nullptr;
         }
     }
-    ggml_tensor * e = ggml_add(ctx0, e1, e2);
     if (lc && !getenv("LLAMA_EC_NOGPU")) {
         // cached experts on the GPU. They are the FIRST operand of the sum, so graph order puts them (with the shared
         // expert) at the head of the GPU split that follows the CPU products: launched before the CPU work (overlap)
