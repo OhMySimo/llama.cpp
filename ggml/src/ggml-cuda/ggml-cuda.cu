@@ -47,6 +47,7 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
+#include "ggml-cuda/cpu-exact.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
@@ -2202,6 +2203,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             }
             break;
         case GGML_OP_GLU:
+            if ((dst->flags & GGML_TENSOR_FLAG_CPU_EXACT) && ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU && dst->src[1]) {
+                ggml_cuda_swiglu_cpu_exact(ctx, dst);
+                break;
+            }
             switch (ggml_get_glu_op(dst)) {
                 case GGML_GLU_OP_REGLU:
                     ggml_cuda_op_reglu(ctx, dst);
@@ -2271,7 +2276,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            if ((dst->src[0]->flags & GGML_TENSOR_FLAG_CPU_EXACT) && ggml_cuda_cpu_exact_supported(dst)) {
+                ggml_cuda_mul_mat_id_cpu_exact(ctx, dst);
+            } else {
+                ggml_cuda_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -3459,6 +3468,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    {   // (fork) CPU-exact expert products must run as their own ops
+        const ggml_tensor * n0 = cgraph->nodes[i];
+        if ((n0->flags & GGML_TENSOR_FLAG_CPU_EXACT) || (n0->op == GGML_OP_MUL_MAT_ID && (n0->src[0]->flags & GGML_TENSOR_FLAG_CPU_EXACT))) {
+            return 0;
+        }
+    }
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {

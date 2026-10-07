@@ -1353,6 +1353,11 @@ bool ecache_load_expert(ecache_group & g, int slot, int e) {
     return true;
 }
 
+// LLAMA_EXPERT_CACHE_EXACT (default 1): the cached experts run with the CUDA kernels that reproduce the CPU's
+// arithmetic (GGML_TENSOR_FLAG_CPU_EXACT), only for single-token steps (the CPU's own path for those): outputs are
+// identical to an all-CPU run. 0: llama.cpp's GPU kernels, faster to write but numerically different
+static bool ecache_exact() { static const bool on = !getenv("LLAMA_EXPERT_CACHE_EXACT") || atoi(getenv("LLAMA_EXPERT_CACHE_EXACT")) != 0; return on; }
+
 void ecache_init(const llama_model & model) {
     const char * prof = getenv("LLAMA_EXPERT_CACHE");
     if (!prof) { g_ec.tried = true; return; }
@@ -1419,6 +1424,7 @@ void ecache_init(const llama_model & model) {
         for (int r = 0; r < 3; r++) {
             g.cache[r] = ggml_new_tensor_3d(g_ec.ctx, g.base[r]->type, g.base[r]->ne[0], g.base[r]->ne[1], g.cap + 1);
             g.cache[r]->flags |= GGML_TENSOR_FLAG_ZERO_LAST_EXPERT;
+            if (ecache_exact()) g.cache[r]->flags |= GGML_TENSOR_FLAG_CPU_EXACT;   // GPU results = CPU results, bit for bit
         }
         g.map = ggml_new_tensor_2d(g_ec.ctx, GGML_TYPE_F32, 1, model.hparams.n_expert);
     }
@@ -1525,7 +1531,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
     if (g_tm.model != &model) tier_maps_init(model);
     const bool lookup = g_tm.model == &model && !getenv("LLAMA_TIER_ARITH");   // 2 ops per group instead of ~10
     ggml_tensor * sel_flat0 = lookup ? ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok) : nullptr;
-    const bool use_cache = g_ec.on && n_tok < 32;   // bigger batches: llama.cpp streams all the experts to the GPU anyway
+    // bigger batches: llama.cpp streams all the experts to the GPU anyway. Exact mode: single tokens only (with more
+    // tokens the CPU may take its tiled path for an expert with several rows, which the exact kernels do not mirror)
+    const bool use_cache = g_ec.on && (ecache_exact() ? n_tok == 1 : n_tok < 32);
     if (g_ec.on && il == 0) {
         auto inp = std::make_unique<llm_graph_input_ecache>();
         inp->small = use_cache;
@@ -1576,9 +1584,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
     ggml_build_forward_expand(gf, e1);
     ggml_build_forward_expand(gf, e2);
     ggml_tensor * e = ggml_add(ctx0, e1, e2);
-    if (n_tok < 32 && !lc) {
+    if (n_tok < 32) {
         cb(e, "ffn_moe_e12_cpu", il);   // on the CPU (graph callback): one tensor to send to the GPU instead of two
         ggml_build_forward_expand(gf, e);
+    }
+    ggml_tensor * eg = nullptr;
+    if (lc && !getenv("LLAMA_EC_NOGPU")) {
+        // cached experts on the GPU, expanded here: the head of the GPU split that follows the CPU products, so the
+        // scheduler launches them before the CPU work (overlap). The CPU writes zeros for these slots and the GPU
+        // writes zeros for the others, so eg + e gives every slot its single value (x + 0 = x)
+        ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok);
+        for (int gi = 0; gi < 2; gi++) {
+            const ecache_group & g = g_ec.L[il][gi];
+            if (g.cap == 0) continue;
+            ggml_tensor * idg = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, g.map, sel_flat), k, n_tok), GGML_TYPE_I32);
+            ggml_tensor * gg = build_lora_mm_id(g.cache[0], x, idg, nullptr);
+            ggml_tensor * uu = build_lora_mm_id(g.cache[1], x, idg, nullptr);
+            ggml_tensor * hh = ggml_swiglu_split(ctx0, gg, uu);
+            if (ecache_exact()) hh->flags |= GGML_TENSOR_FLAG_CPU_EXACT;
+            ggml_tensor * pg = build_lora_mm_id(g.cache[2], hh, idg, nullptr);
+            eg = eg ? ggml_add(ctx0, eg, pg) : pg;
+        }
+        if (eg) ggml_build_forward_expand(gf, eg);
     }
     if (hc_prefix_on()) {
         ggml_build_forward_expand(gf, w);
@@ -1587,20 +1614,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
             g_ffn_prefix = nullptr;
         }
     }
-    if (lc && !getenv("LLAMA_EC_NOGPU")) {
-        // cached experts on the GPU. They are the FIRST operand of the sum, so graph order puts them (with the shared
-        // expert) at the head of the GPU split that follows the CPU products: launched before the CPU work (overlap)
-        ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok);
-        ggml_tensor * eg = nullptr;
-        for (int gi = 0; gi < 2; gi++) {
-            const ecache_group & g = g_ec.L[il][gi];
-            if (g.cap == 0) continue;
-            ggml_tensor * idg = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, g.map, sel_flat), k, n_tok), GGML_TYPE_I32);
-            ggml_tensor * pg = prod(g.cache[0], g.cache[1], g.cache[2], idg);
-            eg = eg ? ggml_add(ctx0, eg, pg) : pg;
-        }
-        if (eg) e = ggml_add(ctx0, eg, e);
-    }
+    if (eg) e = ggml_add(ctx0, eg, e);
     e = ggml_mul(ctx0, e, ggml_reshape_3d(ctx0, w, 1, k, n_tok));
     if (getenv("LLAMA_TIER_SUMROWS")) {   // opt-in: one reduction instead of k-1 adds (NOT bit-identical: sum order)
         ggml_tensor * t = ggml_cont(ctx0, ggml_permute(ctx0, e, 1, 0, 2, 3));      // [k, n_embd, n_tok]

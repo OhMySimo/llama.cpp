@@ -667,6 +667,7 @@ extern "C" {
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_ZERO_LAST_EXPERT = 32, // (fork) MUL_MAT_ID weights whose last expert is all zeros: skip it, write zeros
         GGML_TENSOR_FLAG_EXPERT_CACHE_SKIP = 64, // (fork) MUL_MAT_ID weights: ask the CPU mmid hook which experts another backend computes
+        GGML_TENSOR_FLAG_CPU_EXACT  = 128, // (fork) MUL_MAT_ID weights / SWIGLU node: the CUDA backend reproduces the CPU's results bit for bit
     };
 
     enum ggml_tri_type {

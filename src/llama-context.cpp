@@ -1958,6 +1958,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                if (const char * dump = getenv("LLAMA_DUMP_LOGITS")) {   // (fork) raw logits of every ubatch, for bitwise A/B
+                    ggml_backend_synchronize(backend_res);
+                    static FILE * fl = fopen(dump, "wb");
+                    if (fl) { fwrite(logits_out, sizeof(float), n_outputs*n_vocab, fl); fflush(fl); }
+                }
             }
         }
 
