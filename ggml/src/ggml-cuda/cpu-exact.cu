@@ -1,4 +1,5 @@
 #include "cpu-exact.cuh"
+#include "vecdotq.cuh"
 
 // no implicit a*b+c fusion anywhere in this file: the CPU code rounds products and sums separately unless it
 // uses an explicit fma (written here as __fmaf_rn)
@@ -115,23 +116,25 @@ static __device__ __forceinline__ int cx_signed_dot(uint32_t g, uint32_t neg, in
 
 // ggml_vec_dot_iq3_xxs_q8_K, AVX2: lane L of a 32-value sub-block = bytes 4L..4L+3 (grid entry q3[L]), signs from
 // the 7-bit group L/2 of the sub-block word, scale 2*ls+1; lanes summed over the 8 sub-blocks
-static __device__ __forceinline__ int cx_lane_iq3_xxs(const block_iq3_xxs * bx, const block_q8_K * by, int L) {
+struct cx_tabs { const uint32_t * g3; const uint64_t * g2; const uint32_t * m; };   // grids, sign masks (idx*2 + half)
+
+static __device__ __forceinline__ int cx_lane_iq3_xxs(const block_iq3_xxs * bx, const block_q8_K * by, int L, const cx_tabs & T) {
     const uint8_t * q3  = bx->qs;
     const uint8_t * gas = bx->qs + QK_K/4;
     int sum = 0;
 #pragma unroll
     for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
         const uint32_t aux = cx_ld4(gas + 4*ib32);
-        const uint32_t neg = cx_mask4((ksigns_iq2xs[(aux >> (7*(L >> 1))) & 127] >> ((L & 1)*4)) & 0xf);
+        const uint32_t neg = T.m[((aux >> (7*(L >> 1))) & 127)*2 + (L & 1)];
         const int      q   = *(const int *) (by->qs + 32*ib32 + 4*L);
-        sum += (2*(int)(aux >> 28) + 1) * cx_signed_dot(iq3xxs_grid[q3[8*ib32 + L]], neg, q);
+        sum += (2*(int)(aux >> 28) + 1) * cx_signed_dot(T.g3[q3[8*ib32 + L]], neg, q);
     }
     return sum;
 }
 
 // ggml_vec_dot_iq2_xxs_q8_K, AVX2: per sub-block a word of 4 grid indices (8 values each) and a word of 4 sign
 // groups + the scale; lane L = half L%2 of grid entry L/2
-static __device__ __forceinline__ int cx_lane_iq2_xxs(const block_iq2_xxs * bx, const block_q8_K * by, int L) {
+static __device__ __forceinline__ int cx_lane_iq2_xxs(const block_iq2_xxs * bx, const block_q8_K * by, int L, const cx_tabs & T) {
     const uint8_t * q2 = (const uint8_t *) bx->qs;
     const int m = L >> 1;
     int sum = 0;
@@ -139,9 +142,9 @@ static __device__ __forceinline__ int cx_lane_iq2_xxs(const block_iq2_xxs * bx, 
     for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
         const uint32_t a0   = cx_ld4(q2 + 8*ib32);
         const uint32_t a1   = cx_ld4(q2 + 8*ib32 + 4);
-        const uint64_t grid = iq2xxs_grid[(a0 >> (8*m)) & 0xff];
+        const uint64_t grid = T.g2[(a0 >> (8*m)) & 0xff];
         const uint32_t g    = (L & 1) ? (uint32_t) (grid >> 32) : (uint32_t) grid;
-        const uint32_t neg  = cx_mask4((ksigns_iq2xs[(a1 >> (7*m)) & 127] >> ((L & 1)*4)) & 0xf);
+        const uint32_t neg  = T.m[((a1 >> (7*m)) & 127)*2 + (L & 1)];
         const int      q    = *(const int *) (by->qs + 32*ib32 + 4*L);
         sum += (2*(int)(a1 >> 28) + 1) * cx_signed_dot(g, neg, q);
     }
@@ -186,11 +189,8 @@ static __device__ __forceinline__ int cx_lane_q4_K(const block_q4_K * bx, const 
 
 // ggml_vec_dot_iq4_nl_q8_0, AVX2: lane L = elements 4L..4L+3 of a 32-value block
 static __device__ __forceinline__ int cx_lane_iq4_nl(const block_iq4_nl * bx, const block_q8_0 * by, int L) {
-    const uint32_t q4  = cx_ld4(bx->qs + 4*(L & 3));
-    const uint32_t nib = L < 4 ? (q4 & 0x0f0f0f0f) : ((q4 >> 4) & 0x0f0f0f0f);
-    const uint32_t v   = (uint32_t) (uint8_t) kvalues_iq4nl[nib & 0xf]         | ((uint32_t) (uint8_t) kvalues_iq4nl[(nib >> 8) & 0xf] << 8) |
-                         ((uint32_t) (uint8_t) kvalues_iq4nl[(nib >> 16) & 0xf] << 16) | ((uint32_t) (uint8_t) kvalues_iq4nl[nib >> 24] << 24);
-    return ggml_cuda_dp4a((int) v, (int) cx_ld4((const uint8_t *) by->qs + 4*L), 0);
+    const int2 v = get_int_from_table_16((int) cx_ld4(bx->qs + 4*(L & 3)), kvalues_iq4nl);   // byte values via v_perm
+    return ggml_cuda_dp4a(L < 4 ? v.x : v.y, (int) cx_ld4((const uint8_t *) by->qs + 4*L), 0);
 }
 
 // hsum_float_8: ((a0+a4)+(a2+a6)) + ((a1+a5)+(a3+a7))
@@ -201,7 +201,7 @@ static __device__ __forceinline__ float cx_hsum8(const float * a) {
 
 // one row = 8 threads (lane L = thread & 7), each running the CPU's sequence for its lane; result valid in lane 0
 template <ggml_type type>
-static __device__ __forceinline__ float cx_row(const char * xrow, const char * ycol, int nb, int L) {
+static __device__ __forceinline__ float cx_row(const char * xrow, const char * ycol, int nb, int L, const cx_tabs & T) {
     float a[8];
     float acc = 0.0f, accm = 0.0f;
     if constexpr (type == GGML_TYPE_IQ4_NL) {
@@ -209,6 +209,7 @@ static __device__ __forceinline__ float cx_row(const char * xrow, const char * y
         const block_iq4_nl * bx = (const block_iq4_nl *) xrow;
         const block_q8_0   * by = (const block_q8_0 *) ycol;
         float acc1 = 0.0f, acc2 = 0.0f;
+#pragma unroll 2
         for (int i = 0; i + 1 < nb; i += 2) {
             acc1 = __fmaf_rn(__half2float(by[i].d)     * __half2float(bx[i].d),     (float) cx_lane_iq4_nl(bx + i,     by + i,     L), acc1);
             acc2 = __fmaf_rn(__half2float(by[i + 1].d) * __half2float(bx[i + 1].d), (float) cx_lane_iq4_nl(bx + i + 1, by + i + 1, L), acc2);
@@ -216,13 +217,14 @@ static __device__ __forceinline__ float cx_row(const char * xrow, const char * y
         acc = acc1 + acc2;
     } else {
         const block_q8_K * by = (const block_q8_K *) ycol;
+#pragma unroll 2
         for (int i = 0; i < nb; ++i) {
             if constexpr (type == GGML_TYPE_IQ3_XXS) {
                 const block_iq3_xxs * bx = (const block_iq3_xxs *) xrow + i;
-                acc = __fmaf_rn(__half2float(bx->d) * by[i].d, (float) cx_lane_iq3_xxs(bx, by + i, L), acc);
+                acc = __fmaf_rn(__half2float(bx->d) * by[i].d, (float) cx_lane_iq3_xxs(bx, by + i, L, T), acc);
             } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
                 const block_iq2_xxs * bx = (const block_iq2_xxs *) xrow + i;
-                acc = __fmaf_rn(__half2float(bx->d) * by[i].d, (float) cx_lane_iq2_xxs(bx, by + i, L), acc);
+                acc = __fmaf_rn(__half2float(bx->d) * by[i].d, (float) cx_lane_iq2_xxs(bx, by + i, L, T), acc);
             } else {
                 const block_q4_K * bx = (const block_q4_K *) xrow + i;
                 int mins = 0;
@@ -253,6 +255,18 @@ static __device__ __forceinline__ float cx_row(const char * xrow, const char * y
 
 static __device__ __forceinline__ float cx_v_expf(float x);
 
+// shared-memory copies of the lookup tables, filled by all threads of the block (call before any early return)
+struct cx_stabs { uint32_t g3[256]; uint64_t g2[256]; uint32_t m[256]; };
+static __device__ __forceinline__ cx_tabs cx_load_tabs(cx_stabs & S) {
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        S.g3[i] = iq3xxs_grid[i];
+        S.g2[i] = iq2xxs_grid[i];
+        S.m[i]  = cx_mask4((ksigns_iq2xs[i >> 1] >> ((i & 1)*4)) & 0xf);
+    }
+    __syncthreads();
+    return { S.g3, S.g2, S.m };
+}
+
 #define CX_MAX_NB      64
 #define CX_ROWS_BLOCK  32   // 8 threads per row, 256 threads per block
 
@@ -267,6 +281,8 @@ static __global__ void cx_mmid_rows(
     const int row  = blockIdx.x*CX_ROWS_BLOCK + (threadIdx.x >> 3);
     const int slot = blockIdx.y;
     const int tok  = blockIdx.z;
+    __shared__ cx_stabs S;
+    const cx_tabs T = cx_load_tabs(S);
     if (row >= ne01) {
         return;   // the whole 8-thread group
     }
@@ -280,9 +296,9 @@ static __global__ void cx_mmid_rows(
     }
     const size_t off  = (size_t) expert*nb02 + (size_t) row*nb01;
     const char * ycol = qy + (size_t) ((slot % ne11) + tok*ne11)*qy_col_bytes;
-    const float r = cx_row<type>(src0 + off, ycol, nb, L);
+    const float r = cx_row<type>(src0 + off, ycol, nb, L, T);
     if constexpr (fused) {
-        const float u = cx_row<type>(src0_up + off, ycol, nb, L);
+        const float u = cx_row<type>(src0_up + off, ycol, nb, L, T);
         if (L == 0) {
             out[row] = (r / (1.0f + cx_v_expf(0.0f - r))) * u;
         }
@@ -447,13 +463,14 @@ void ggml_cuda_swiglu_cpu_exact(ggml_backend_cuda_context & ctx, ggml_tensor * d
 // output for slots cached in either group, 0 elsewhere. Three launches: q8_K of x, gate+up+swiglu, down (with the
 // q8_0 of the swiglu output done per block). Same arithmetic as the separate ops.
 
-static __device__ __forceinline__ float cx_row_dyn(int type, const char * xrow, const char * ycol, int nb, int L) {
+static __device__ __forceinline__ float cx_row_dyn(int type, const char * xrow, const char * ycol, int nb, int L, const cx_tabs & T) {
     switch (type) {
-        case GGML_TYPE_IQ3_XXS: return cx_row<GGML_TYPE_IQ3_XXS>(xrow, ycol, nb, L);
-        case GGML_TYPE_IQ2_XXS: return cx_row<GGML_TYPE_IQ2_XXS>(xrow, ycol, nb, L);
-        default:                return cx_row<GGML_TYPE_Q4_K>(xrow, ycol, nb, L);
+        case GGML_TYPE_IQ3_XXS: return cx_row<GGML_TYPE_IQ3_XXS>(xrow, ycol, nb, L, T);
+        case GGML_TYPE_IQ2_XXS: return cx_row<GGML_TYPE_IQ2_XXS>(xrow, ycol, nb, L, T);
+        default:                return cx_row<GGML_TYPE_Q4_K>(xrow, ycol, nb, L, T);
     }
 }
+
 
 struct cx_grp { const char * gate; const char * up; const char * down; const float * map; size_t nb01, nb02, dnb01, dnb02; int type, cap; };
 
@@ -466,16 +483,18 @@ static __device__ __forceinline__ int cx_find(const cx_grp & g1, const cx_grp & 
 static __global__ void cx_block_gateup(cx_grp g1, cx_grp g2, const char * ids, size_t ids_nb0, size_t ids_nb1,
                                        const char * qy, size_t qy_col_bytes, int nb, int n_ff, int k, float * h) {
     const int L = threadIdx.x & 7, row = blockIdx.x*CX_ROWS_BLOCK + (threadIdx.x >> 3), slot = blockIdx.y, tok = blockIdx.z;
-    if (row >= n_ff) return;
     const int e = *(const int32_t *) (ids + slot*ids_nb0 + tok*ids_nb1);
+    {   int cs0 = 0; if (cx_find(g1, g2, e, cs0) < 0) return; }   // whole block: not cached
+    __shared__ cx_stabs S;
+    const cx_tabs T = cx_load_tabs(S);
+    if (row >= n_ff) return;
     int cs = 0;
     const int grp = cx_find(g1, g2, e, cs);
-    if (grp < 0) return;                       // not cached: this slot's h is never read
     const cx_grp & g = grp == 0 ? g1 : g2;
     const size_t off = (size_t) cs*g.nb02 + (size_t) row*g.nb01;
     const char * ycol = qy + (size_t) tok*qy_col_bytes;
-    const float r = cx_row_dyn(g.type, g.gate + off, ycol, nb, L);
-    const float u = cx_row_dyn(g.type, g.up   + off, ycol, nb, L);
+    const float r = cx_row_dyn(g.type, g.gate + off, ycol, nb, L, T);
+    const float u = cx_row_dyn(g.type, g.up   + off, ycol, nb, L, T);
     if (L == 0) {
         h[((size_t) tok*k + slot)*n_ff + row] = (r / (1.0f + cx_v_expf(0.0f - r))) * u;
     }
@@ -509,7 +528,7 @@ static __global__ void cx_block_down(cx_grp g1, cx_grp g2, const char * ids, siz
     __syncthreads();
     if (row >= n_embd) return;
     const cx_grp & g = grp == 0 ? g1 : g2;
-    const float r = cx_row<GGML_TYPE_IQ4_NL>(g.down + (size_t) cs*g.dnb02 + (size_t) row*g.dnb01, (const char *) sq, nbq, L);
+    const float r = cx_row<GGML_TYPE_IQ4_NL>(g.down + (size_t) cs*g.dnb02 + (size_t) row*g.dnb01, (const char *) sq, nbq, L, cx_tabs{});
     if (L == 0) out[row] = r;
 }
 
@@ -538,10 +557,24 @@ void ggml_cuda_ecache_block_exact(ggml_backend_cuda_context & ctx, ggml_tensor *
     const size_t col_bytes = ggml_row_size(GGML_TYPE_Q8_K, n_embd);
     ggml_cuda_pool_alloc<char>  qy(ctx.pool(), (size_t) n_tok*col_bytes);
     ggml_cuda_pool_alloc<float> h(ctx.pool(), (size_t) n_tok*k*n_ff);
+    // LLAMA_CX_BLOCK_PROF=1: GPU time of the three launches, summed per 48 calls (one token)
+    static const bool bprof = getenv("LLAMA_CX_BLOCK_PROF") != nullptr;
+    static cudaEvent_t ev[4]; static bool ev_init = false; static double acc[3]; static int calls = 0;
+    if (bprof && !ev_init) { for (auto & e : ev) CUDA_CHECK(cudaEventCreateWithFlags(&e, 0)); ev_init = true; }
+    if (bprof) CUDA_CHECK(cudaEventRecord(ev[0], stream));
     cx_quantize_q8_K<false><<<dim3(n_embd/QK_K, n_tok), 256, 0, stream>>>((const char *) x->data, x->nb[2], (block_q8_K *) qy.get(), n_embd/QK_K);
+    if (bprof) CUDA_CHECK(cudaEventRecord(ev[1], stream));
     cx_block_gateup<<<dim3((n_ff + CX_ROWS_BLOCK - 1)/CX_ROWS_BLOCK, k, n_tok), 8*CX_ROWS_BLOCK, 0, stream>>>(
         g1, g2, (const char *) ids->data, ids->nb[0], ids->nb[1], qy.get(), col_bytes, n_embd/QK_K, n_ff, k, h.get());
+    if (bprof) CUDA_CHECK(cudaEventRecord(ev[2], stream));
     cx_block_down<<<dim3((n_embd + CX_ROWS_BLOCK - 1)/CX_ROWS_BLOCK, k, n_tok), 8*CX_ROWS_BLOCK, 0, stream>>>(
         g1, g2, (const char *) ids->data, ids->nb[0], ids->nb[1], h.get(), n_ff, n_embd, k, (char *) dst->data, dst->nb[1], dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());
+    if (bprof) {
+        CUDA_CHECK(cudaEventRecord(ev[3], stream));
+        CUDA_CHECK(cudaEventSynchronize(ev[3]));
+        float a, b, c; CUDA_CHECK(hipEventElapsedTime(&a, ev[0], ev[1])); CUDA_CHECK(hipEventElapsedTime(&b, ev[1], ev[2])); CUDA_CHECK(hipEventElapsedTime(&c, ev[2], ev[3]));
+        acc[0] += a; acc[1] += b; acc[2] += c;
+        if (++calls % (48*64) == 0) { fprintf(stderr, "[cx-block] per token: quant %.2f ms, gate/up %.2f ms, down %.2f ms\n", acc[0]/64, acc[1]/64, acc[2]/64); acc[0] = acc[1] = acc[2] = 0; }
+    }
 }
