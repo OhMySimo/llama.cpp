@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <thread>
+#include <pthread.h>
+#include <sched.h>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
@@ -1517,6 +1519,17 @@ static ecache_worker & g_ecw = *new ecache_worker();   // never destroyed: the d
 bool ecache_read(const ggml_tensor * t, int e, uint8_t * dst);
 
 static void ecache_worker_loop() {
+    {   // keep the copies off the compute threads' cores: LLAMA_EXPERT_CACHE_WORKER_CPUS (default 16-31, the E-cores
+        // of the i9 this was tuned on; empty = no pinning)
+        const char * e = getenv("LLAMA_EXPERT_CACHE_WORKER_CPUS");
+        int lo = 16, hi = 31;
+        if (e && *e) sscanf(e, "%d-%d", &lo, &hi);
+        if (!(e && !*e) && lo <= hi) {
+            cpu_set_t set; CPU_ZERO(&set);
+            for (int c = lo; c <= hi && c < CPU_SETSIZE; c++) CPU_SET(c, &set);
+            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        }
+    }
     for (;;) {
         ecache_job j;
         {
