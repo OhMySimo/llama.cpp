@@ -4735,6 +4735,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             double tot = 0; long nodes = 0;
             for (size_t q = 0; q < sp_n; q++) { float ms = 0; CUDA_CHECK(hipEventElapsedTime(&ms, sp_ev[q].first, sp_ev[q].second)); tot += ms; nodes += sp_nodes[q]; }
             fprintf(stderr, "[gpu-split-prof] per token: GPU busy %.2f ms over %ld graph nodes (graphs %s)\n", tot / 16, nodes / 16, use_cuda_graph ? "on" : "off");
+            if (atoi(getenv("LLAMA_GPU_SPLIT_PROF")) >= 2) {   // per graph size (node count): calls per token and mean ms
+                std::map<int, std::pair<double, int>> by;
+                for (size_t q = 0; q < sp_n; q++) { float ms = 0; CUDA_CHECK(hipEventElapsedTime(&ms, sp_ev[q].first, sp_ev[q].second)); by[sp_nodes[q]].first += ms; by[sp_nodes[q]].second++; }
+                for (auto & kv : by) fprintf(stderr, "[gpu-split-prof]   %4d nodes: %5.1f calls/token, %7.1f us each, %6.2f ms/token\n", kv.first, kv.second.second / 16.0, 1000*kv.second.first / kv.second.second, kv.second.first / 16);
+            }
             sp_n = 0;
         }
     }
