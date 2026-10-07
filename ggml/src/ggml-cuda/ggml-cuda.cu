@@ -33,7 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
-#include "ggml-cuda/hc-chain.cuh"
+#include "ggml-cuda/layer-mk.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -3478,6 +3478,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // element before writing the same element, from the same thread). The copy is skipped and the kernel reads the cell
 // in place: same values. Nothing between the two nodes may write the cell. Map: elided GET_ROWS -> cell data.
 static std::unordered_map<const ggml_tensor *, const float *> g_rs_elided;
+bool ggml_cuda_compute_node(ggml_backend_cuda_context & ctx, ggml_tensor * t) { return ggml_cuda_compute_forward(ctx, t); }
+void ggml_cuda_tdump(const char * dir, const char * tag, const ggml_tensor * t, const void * data, size_t bytes) {
+    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || !bytes || bytes > (8u << 20)) return;
+    std::vector<char> h(bytes);
+    CUDA_CHECK(cudaMemcpy(h.data(), data, bytes, cudaMemcpyDeviceToHost));
+    char fn[512]; snprintf(fn, sizeof(fn), "%s/%s_%llu_%s_%s.bin", dir, tag, (unsigned long long) ggml_cuda_graph_epoch, ggml_op_desc(t), t->name);
+    for (char * c = fn + strlen(dir) + 1; *c; c++) if (*c == ' ' || *c == '(' || *c == ')' || *c == '#') *c = '_';
+    FILE * f = fopen(fn, "wb"); if (f) { fwrite(h.data(), 1, bytes, f); fclose(f); }
+}
+void ggml_cuda_rs_elide(const ggml_tensor * g) { g_rs_elided[g] = (const float *) g->src[0]->data; }
 
 static bool ggml_cuda_rs_get_rows_elidable(const ggml_cgraph * cgraph, int i) {
     static const bool off = getenv("LLAMA_NO_RS_ELIDE") != nullptr;
@@ -3542,9 +3552,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
-    // fork: the whole hyper-connection chain in one persistent kernel
+    // fork: hyper-connection chains and linear attention in one persistent kernel (layer-mk.cu)
     if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_RMS_NORM) {
-        const int n = ggml_cuda_try_hc_chain(*cuda_ctx, cgraph, i);
+        const int n = ggml_cuda_try_layer_mk(*cuda_ctx, cgraph, i);
         if (n > 0) {
             return n;
         }
@@ -4477,6 +4487,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                {   // LLAMA_TDUMP=<dir> LLAMA_TDUMP_AT=<graph_compute epoch> (fork, debug): node outputs right after they run
+                    static const char * tdir = getenv("LLAMA_TDUMP");
+                    static const long tat = getenv("LLAMA_TDUMP_AT") ? atol(getenv("LLAMA_TDUMP_AT")) : -1;
+                    static const long tat2 = getenv("LLAMA_TDUMP_TO") ? atol(getenv("LLAMA_TDUMP_TO")) : tat;
+                    if (tdir && (long) ggml_cuda_graph_epoch >= tat && (long) ggml_cuda_graph_epoch <= tat2) {
+                        if (nodes_to_skip == 0) ggml_cuda_compute_forward(*cuda_ctx, node);
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        for (int q = i; q <= i + nodes_to_skip; q++) ggml_cuda_tdump(tdir, "ref", cgraph->nodes[q], cgraph->nodes[q]->data, ggml_nbytes(cgraph->nodes[q]));
+                        if (nodes_to_skip == 0) { i += 0; continue; }
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
