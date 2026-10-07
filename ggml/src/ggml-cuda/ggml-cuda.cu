@@ -2675,6 +2675,11 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
+    if (stat != cudaSuccess && stat != cudaErrorGraphExecUpdateFailure) {   // (fork) HIP may report other codes: re-instantiate
+        static bool warned = false;
+        if (!warned) { warned = true; GGML_LOG_WARN("%s: graph update returned %d (%s), re-instantiating\n", __func__, (int) stat, cudaGetErrorString(stat)); }
+        stat = cudaErrorGraphExecUpdateFailure;
+    }
     if (stat == cudaErrorGraphExecUpdateFailure) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);

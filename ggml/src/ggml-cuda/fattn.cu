@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-vec-gqa.cuh"
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -494,6 +495,9 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
 }
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_vec_gqa(ctx, dst)) {   // (fork) LLAMA_FA_GQA
+        return;
+    }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -755,7 +759,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+static void ggml_cuda_flash_attn_ext_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// LLAMA_FA_TIME=1 (fork, graphs off): GPU time of the decode FlashAttention calls, printed every 120 calls
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const bool ft = getenv("LLAMA_FA_TIME") != nullptr;
+    if (!ft || dst->src[0]->ne[1] != 1) { ggml_cuda_flash_attn_ext_impl(ctx, dst); return; }
+    static cudaEvent_t e0 = nullptr, e1 = nullptr; static double acc = 0; static long n = 0;
+    if (!e0) { CUDA_CHECK(hipEventCreate(&e0)); CUDA_CHECK(hipEventCreate(&e1)); }
+    CUDA_CHECK(cudaEventRecord(e0, ctx.stream()));
+    ggml_cuda_flash_attn_ext_impl(ctx, dst);
+    CUDA_CHECK(cudaEventRecord(e1, ctx.stream()));
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    float ms = 0; CUDA_CHECK(hipEventElapsedTime(&ms, e0, e1)); acc += ms;
+    if (++n % 120 == 0) { fprintf(stderr, "[fa-time] n_kv %lld: %.1f us per decode call\n", (long long) dst->src[1]->ne[1], 1000*acc/120); acc = 0; }
+}
+
+static void ggml_cuda_flash_attn_ext_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
