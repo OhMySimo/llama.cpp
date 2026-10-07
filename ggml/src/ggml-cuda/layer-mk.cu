@@ -68,12 +68,16 @@ static __device__ __forceinline__ void mk_grid_sync(unsigned * bar) {
 
 // ---------------------------------------------------------------- stages
 
+// threadIdx.x behind an empty asm: values derived from it are recomputed in each stage instead of being hoisted out
+// of the stage loop (where all stages' hoisted values would stay live together and raise the kernel's VGPR count)
+static __device__ __forceinline__ int mk_tid() { int t = threadIdx.x; asm volatile("" : "+v"(t)); return t; }
+
 // dsv4_hc_post_f32<false>: dst[i0, k] = x[i0]*post[k] + res[i0, k]
 static __device__ void mk_hc_post(const mk_stage & s) {
     const float * x = (const float *) s.a, * res = (const float *) s.b, * post = (const float *) s.c;
     float * dst = (float *) s.x;
     const int n = s.n0, ne = s.n0*s.n1;
-    for (int ir = blockIdx.x*MK_NT + threadIdx.x; ir < ne; ir += gridDim.x*MK_NT) {
+    for (int ir = blockIdx.x*MK_NT + mk_tid(); ir < ne; ir += gridDim.x*MK_NT) {
         const int i0 = ir % n, idst = ir / n;
         float sum = x[i0] * post[idst];
         sum += res[i0 + idst*n];
@@ -84,7 +88,7 @@ static __device__ void mk_hc_post(const mk_stage & s) {
 // rms_norm_f32<1024, true> (1024 < n <= 3072): one 1024-thread virtual block per row, emulated with 4 virtual threads
 // per thread (v = tid + 256*j, virtual warp 8*j + wave); columns kept in registers between the two passes
 static __device__ void mk_rms_big(const mk_stage & s, float * s_red) {
-    const int tid = threadIdx.x, lane = tid % 32, wv = tid / 32, n = s.n0;
+    const int tid = mk_tid(), lane = tid % 32, wv = tid / 32, n = s.n0;
     for (int row = blockIdx.x; row < s.n1; row += gridDim.x) {
         const float * x = (const float *) s.a + row*n;
         const float * w = (const float *) s.b + row*n;
@@ -138,7 +142,7 @@ static __device__ void mk_rms_big(const mk_stage & s, float * s_red) {
 static __device__ void mk_quant(const mk_stage & s) {
     const float * x = (const float *) s.a;
     block_q8_1 * y = (block_q8_1 *) s.x;
-    for (int i0 = blockIdx.x*MK_NT + threadIdx.x; i0 < s.n0; i0 += gridDim.x*MK_NT) {
+    for (int i0 = blockIdx.x*MK_NT + mk_tid(); i0 < s.n0; i0 += gridDim.x*MK_NT) {
         const float xi = x[i0];
         float amax = fabsf(xi);
         float sum = xi;
@@ -157,7 +161,7 @@ static __device__ void mk_quant(const mk_stage & s) {
 // k-split variant): per lane the contracted fma chain over its blocks in order, then the warp reduction
 static __device__ void mk_matvec(const mk_stage & s) {
     constexpr int qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ, bpi = vdr*32/qi, U = 8, RW = 1;
-    const int lane = threadIdx.x % 32, gw = blockIdx.x*MK_NW + threadIdx.x/32;
+    const int lane = mk_tid() % 32, gw = blockIdx.x*MK_NW + mk_tid()/32;
     const int bpr = s.n1 / QK8_0;
     const int kbx0 = lane / (qi/vdr), kqs = vdr * (lane % (qi/vdr));
     const int niter = (bpr - kbx0 + bpi - 1) / bpi;
@@ -213,7 +217,7 @@ static __device__ void mk_matvec(const mk_stage & s) {
 
 // scale + silu + q8_1 (mul_mat_vec_q8_0_multirow_scale_silu's prologue, once per workgroup), then its multirow loop
 static __device__ void mk_silu_up(const mk_stage & s, block_q8_1 * ys) {
-    const int tid = threadIdx.x, lane = tid % 32, wv = tid / 32;
+    const int tid = mk_tid(), lane = tid % 32, wv = tid / 32;
     const float * lo = (const float *) s.a;
     const int n_lo = s.n0, nqb = n_lo / QK8_1;
     for (int b = wv; b < nqb; b += MK_NW) {
@@ -272,7 +276,7 @@ static __device__ void mk_silu_up(const mk_stage & s, block_q8_1 * ys) {
 static __device__ void mk_hc_pre(const mk_stage & s) {
     const float * xn = (const float *) s.a, * gate = (const float *) s.b;
     float * mixed = (float *) s.x;
-    for (int i0 = blockIdx.x*MK_NT + threadIdx.x; i0 < s.n0; i0 += gridDim.x*MK_NT) {
+    for (int i0 = blockIdx.x*MK_NT + mk_tid(); i0 < s.n0; i0 += gridDim.x*MK_NT) {
         float sum = 0.0f;
         for (int ih = 0; ih < s.n1; ++ih) {
             const float xv = xn[i0 + ih*s.n0];
@@ -290,7 +294,7 @@ static __device__ void mk_lin_conv(const mk_stage & s) {
     const float * qkv = (const float *) s.a, * w = (const float *) s.c;
     float * st = (float *) s.b, * out = (float *) s.x;
     const float b = s.f0;
-    for (int c = blockIdx.x*MK_NT + threadIdx.x; c < s.n0; c += gridDim.x*MK_NT) {
+    for (int c = blockIdx.x*MK_NT + mk_tid(); c < s.n0; c += gridDim.x*MK_NT) {
         float x[4];
         x[0] = st[3*c + 0]; x[1] = st[3*c + 1]; x[2] = st[3*c + 2]; x[3] = qkv[c];
         float sumf = 0.0f;
@@ -308,7 +312,7 @@ static __device__ void mk_lin_conv(const mk_stage & s) {
 static __device__ void mk_alpha(const mk_stage & s) {
     const float * al = (const float *) s.a, * bias = (const float *) s.b, * aa = (const float *) s.c;
     float * g = (float *) s.x;
-    for (int i = blockIdx.x*MK_NT + threadIdx.x; i < s.n0; i += gridDim.x*MK_NT) {
+    for (int i = blockIdx.x*MK_NT + mk_tid(); i < s.n0; i += gridDim.x*MK_NT) {
         const float t = al[i] + bias[i];
         const float sp = (t > 20.0f) ? t : logf(1.0f + expf(t));
         g[i] = sp * aa[i];
@@ -318,7 +322,7 @@ static __device__ void mk_alpha(const mk_stage & s) {
 static __device__ void mk_sigmoid(const mk_stage & s) {
     const float * x = (const float *) s.a;
     float * y = (float *) s.x;
-    for (int i = blockIdx.x*MK_NT + threadIdx.x; i < s.n0; i += gridDim.x*MK_NT) {
+    for (int i = blockIdx.x*MK_NT + mk_tid(); i < s.n0; i += gridDim.x*MK_NT) {
         y[i] = 1.0f / (1.0f + expf(-x[i]));
     }
 }
@@ -327,7 +331,7 @@ static __device__ void mk_sigmoid(const mk_stage & s) {
 static __device__ void mk_sss(const mk_stage & s) {
     const float * x = (const float *) s.a;
     float * dst = (float *) s.x;
-    for (int i = blockIdx.x*MK_NT + threadIdx.x; i < s.n0; i += gridDim.x*MK_NT) {
+    for (int i = blockIdx.x*MK_NT + mk_tid(); i < s.n0; i += gridDim.x*MK_NT) {
         float y = s.f0 * x[i] + s.f1;
         y = 1.0f / (1.0f + expf(-y));
         y = s.f2 * y + s.f3;
@@ -338,7 +342,7 @@ static __device__ void mk_sss(const mk_stage & s) {
 // rms_norm_f32<256, ...> for rows of n <= 256 columns: one workgroup per row running the original code (block_reduce)
 // n2 = 0: fused SCALE: dst = f1 * (scale * x);   n2 = 1: fused MUL by w (b), then SIGMOID(z)*that (c = z)
 static __device__ void mk_rms_small(const mk_stage & s, float * s_sum) {
-    const int tid = threadIdx.x, n = s.n0;
+    const int tid = mk_tid(), n = s.n0;
     for (int row = blockIdx.x; row < s.n1; row += gridDim.x) {
         const float * x = (const float *) s.a + row*n;
         float tmp = 0.0f;
@@ -366,7 +370,7 @@ static __device__ void mk_rms_small(const mk_stage & s, float * s_sum) {
 // gated_delta_net_cuda<128, false, false>, one token, one sequence: one wave per (head, column), state in place
 static __device__ void mk_gdn(const mk_stage & s) {
     constexpr int S_v = 128, warp_size = 32, rows_per_lane = S_v / warp_size;
-    const int lane = threadIdx.x % 32, gw = blockIdx.x*MK_NW + threadIdx.x/32;
+    const int lane = mk_tid() % 32, gw = blockIdx.x*MK_NW + mk_tid()/32;
     const int H = s.n0, Hqk = s.n1;
     const float * q = (const float *) s.a, * k = (const float *) s.b, * v = (const float *) s.c;
     const float * g = (const float *) s.d, * beta = (const float *) s.e;
@@ -424,7 +428,7 @@ static __device__ void mk_combine(const mk_stage & s) {
     const float * ca = (const float *) s.a, * cb = (const float *) s.b, * w = (const float *) s.c, * sh = (const float *) s.d;
     const int n = s.n0, k = s.n1;
     const float one = s.f0;   // 1.0f, a runtime value as in the original kernel
-    for (int col = blockIdx.x*MK_NT + threadIdx.x; col < n; col += gridDim.x*MK_NT) {
+    for (int col = blockIdx.x*MK_NT + mk_tid(); col < n; col += gridDim.x*MK_NT) {
         float sum = ((ca ? ca[col] + cb[col] : cb[col]) * one) * w[0];
         for (int e = 1; e < k; ++e) {
             const float v = ca ? ca[e*n + col] + cb[e*n + col] : cb[e*n + col];
@@ -437,7 +441,7 @@ static __device__ void mk_combine(const mk_stage & s) {
 
 // mul_mat_vec_f<float, float, 1, 256>: one workgroup per row, the original block code (ncols even)
 static __device__ void mk_matvec_f32(const mk_stage & s, float * buf_iw) {
-    const int tid = threadIdx.x, ncols2 = s.n1/2;
+    const int tid = mk_tid(), ncols2 = s.n1/2;
     for (int row = blockIdx.x; row < s.n0; row += gridDim.x) {
         const float2 * x2 = (const float2 *) ((const float *) s.a + (size_t) row*s.n1);
         const float2 * y2 = (const float2 *) s.b;
@@ -466,7 +470,7 @@ static __device__ void mk_matvec_f32(const mk_stage & s, float * buf_iw) {
 // 256 columns), the first n1 indices copied (CONT of the top-k view). a: logits; x: probs, y: sorted ids, b: top-k ids
 static __device__ void mk_router(const mk_stage & s, float * buf_iw, float * vals, int * dst_row) {
     if (blockIdx.x != 0) return;
-    const int tid = threadIdx.x, ncols = 256;
+    const int tid = mk_tid(), ncols = 256;
     const float * x = (const float *) s.a;
     const float * mask = (const float *) s.c;   // nullptr
     const float slope = 1.0f;
@@ -522,7 +526,7 @@ static __device__ void mk_router(const mk_stage & s, float * buf_iw, float * val
 static __device__ void mk_copy(const mk_stage & s) {   // n0 floats
     const float * a = (const float *) s.a;
     float * x = (float *) s.x;
-    for (int i = blockIdx.x*MK_NT + threadIdx.x; i < s.n0; i += gridDim.x*MK_NT) {
+    for (int i = blockIdx.x*MK_NT + mk_tid(); i < s.n0; i += gridDim.x*MK_NT) {
         x[i] = a[i];
     }
 }

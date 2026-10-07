@@ -1516,6 +1516,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const int64_t blck_1 = 16;
 
     float tmp[16];
+    static int mmid_pf = -1;
+    if (mmid_pf < 0) { const char * e = getenv("LLAMA_MMID_PF"); mmid_pf = e ? atoi(e) : 0; }
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -1543,6 +1545,10 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                    if (mmid_pf && ir0 + mmid_pf < ir0_end) {   // (fork) software prefetch mmid_pf rows ahead
+                        const char * pr = src0_cur + (ir0 + mmid_pf)*nb01;
+                        for (size_t o = 0; o < nb01; o += 64) __builtin_prefetch(pr + o, 0, 3);
+                    }
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                 }
 
@@ -1700,7 +1706,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     // LLAMA_MMID_PROF=1 (fork): per thread, rows computed and time from the post-grouping barrier to done
     static int mprof = -1; if (mprof < 0) mprof = getenv("LLAMA_MMID_PROF") ? 1 : 0;
-    static int64_t mp_rows[64], mp_us[64], mp_start[64]; static int64_t mp_calls = 0;
+    static int64_t mp_rows[64], mp_us[64], mp_start[64], mp_bytes[64]; static int64_t mp_calls = 0;
     const int64_t mp_t0 = mprof ? ggml_time_us() : 0;
     int64_t mp_r = 0;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -1780,6 +1786,7 @@ static void ggml_compute_forward_mul_mat_id(
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
             mp_r += ir0_end - ir0_start;
+            if (mprof && ith < 64) mp_bytes[ith] += (ir0_end - ir0_start)*nb01*(ir1_end - ir1_start);
 
             if (nth >= nchunk0 * nchunk1) {
                 break;
@@ -1793,7 +1800,8 @@ static void ggml_compute_forward_mul_mat_id(
         if (ith == 0 && ++mp_calls % 2880 == 0) {
             fprintf(stderr, "[mmid-prof] per op (avg of 2880): rows/us by thread:");
             for (int t = 0; t < nth && t < 64; t++) { fprintf(stderr, " %lld/%lld", (long long) (mp_rows[t] / 2880), (long long) (mp_us[t] / 2880)); mp_rows[t] = mp_us[t] = 0; }
-            fprintf(stderr, "\n");
+            int64_t tb = 0; for (int t = 0; t < nth && t < 64; t++) { tb += mp_bytes[t]; mp_bytes[t] = 0; }
+            fprintf(stderr, " | weight bytes per op %.3f MB (x%d ops per token = %.1f MB)\n", tb / 2880.0 / 1e6, 288, tb / 2880.0 / 1e6 * 288);
         }
     }
 }

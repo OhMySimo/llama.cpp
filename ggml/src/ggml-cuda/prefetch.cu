@@ -46,6 +46,12 @@ static __global__ void __launch_bounds__(PF_NT) pf_kernel(const pf_args a) {
     if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x7f3a5c21) a.sink[0] = 1;   // keeps the loads
 }
 
+// LLAMA_GPU_PREFETCH_STREAM=1: the prefetch runs on its own stream, concurrently with the overlap prefix
+extern "C" int ggml_cuda_fork_prefetch_concurrent(void) {
+    static const int on = [] { const char * e = getenv("LLAMA_GPU_PREFETCH_STREAM"); return e ? atoi(e) : 0; }();
+    return on;
+}
+
 static unsigned int * g_pf_stop = nullptr;
 static int * g_pf_sink = nullptr;
 static unsigned int g_pf_seq = 0;
@@ -73,7 +79,22 @@ extern "C" unsigned int ggml_cuda_fork_prefetch(void * backend_ctx, int n, const
     a.stop = g_pf_stop;
     a.sink = g_pf_sink;
     static const int grid = [] { const char * e = getenv("LLAMA_GPU_PREFETCH_GRID"); return e ? atoi(e) : 80; }();
-    pf_kernel<<<grid, PF_NT, 0, ctx->stream()>>>(a);
+    if (ggml_cuda_fork_prefetch_concurrent()) {
+        // on its own low-priority stream, after the work queued so far (the previous split): runs alongside the
+        // overlap prefix that is queued next on the main stream
+        static cudaStream_t st = nullptr; static cudaEvent_t ev = nullptr;
+        if (!st) {
+            int lo, hi;
+            CUDA_CHECK(hipDeviceGetStreamPriorityRange(&lo, &hi));
+            CUDA_CHECK(hipStreamCreateWithPriority(&st, cudaStreamNonBlocking, lo));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(ev, ctx->stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(st, ev, 0));
+        pf_kernel<<<grid, PF_NT, 0, st>>>(a);
+    } else {
+        pf_kernel<<<grid, PF_NT, 0, ctx->stream()>>>(a);
+    }
     return seq;
 }
 

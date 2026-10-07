@@ -1845,18 +1845,22 @@ volatile int ggml_fork_gpu_wait = 0;
 // Loads only, stopped when the CPU split ends: results unchanged.
 typedef unsigned int (*pf_fn_t)(void *, int, const void * const *, const size_t *);
 typedef void (*pf_stop_fn_t)(unsigned int);
+typedef int (*pf_conc_fn_t)(void);
 static pf_stop_fn_t g_pf_stop = nullptr;
-static unsigned int sched_prefetch(ggml_backend_t nb, const struct ggml_backend_sched_split * nxt, int first) {
+// before = true: called before the overlap prefix is queued (only acts in the concurrent-stream mode), false: after it
+static unsigned int sched_prefetch(ggml_backend_t nb, const struct ggml_backend_sched_split * nxt, int first, bool before) {
     static const size_t budget = [] { const char * e = getenv("LLAMA_GPU_PREFETCH_MB"); return (size_t) (e ? atof(e) : 0) << 20; }();
     if (budget == 0) return 0;
-    static pf_fn_t fn = nullptr; static bool looked = false;
+    static pf_fn_t fn = nullptr; static bool looked = false, conc = false;
     if (!looked) {
         looked = true;
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(nb));
         fn        = (pf_fn_t)      ggml_backend_reg_get_proc_address(reg, "ggml_cuda_fork_prefetch");
         g_pf_stop = (pf_stop_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_fork_prefetch_stop");
+        pf_conc_fn_t cf = (pf_conc_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_fork_prefetch_concurrent");
+        conc = cf && cf();
     }
-    if (!fn || !g_pf_stop) return 0;
+    if (!fn || !g_pf_stop || before != conc) return 0;
     const void * ptrs[48]; size_t sizes[48]; int n = 0; size_t tot = 0;
     for (int i = first; i < nxt->graph.n_nodes && n < 48 && tot < budget; i++) {
         const ggml_tensor * node = nxt->graph.nodes[i];
@@ -2120,6 +2124,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     for (int q = 0; q < nxt->graph.n_nodes && q < p + 3; q++) fprintf(stderr, " %s%s(%s)", q == p ? "|| " : "", ggml_op_desc(nxt->graph.nodes[q]), nxt->graph.nodes[q]->name);
                     fprintf(stderr, "\n");
                 }
+                pf_seq = sched_prefetch(nb, nxt, p, true);
                 if (p > 0) {
                     struct ggml_cgraph gv = ggml_graph_view(&nxt->graph, 0, p);
                     static double tp = 0; static long tpn = 0; const double tp0 = tl ? sched_now_ms() : 0;
@@ -2129,7 +2134,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     launched_prefix_split = split_id + 1;
                     launched_prefix_len   = p;
                 }
-                pf_seq = sched_prefetch(nb, nxt, p);
+                if (!pf_seq) pf_seq = sched_prefetch(nb, nxt, p, false);
             }
         }
         struct ggml_cgraph split_graph_rest = split->graph;

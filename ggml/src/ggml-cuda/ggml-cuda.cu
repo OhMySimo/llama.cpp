@@ -6031,6 +6031,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 extern "C" unsigned int ggml_cuda_fork_prefetch(void * backend_ctx, int n, const void * const * ptrs, const size_t * sizes);
 extern "C" void ggml_cuda_fork_prefetch_stop(unsigned int seq);
+extern "C" int ggml_cuda_fork_prefetch_concurrent(void);
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
@@ -6054,6 +6055,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_cuda_fork_prefetch") == 0) {
         return (void *)ggml_cuda_fork_prefetch;
+    }
+    if (strcmp(name, "ggml_cuda_fork_prefetch_concurrent") == 0) {
+        return (void *)ggml_cuda_fork_prefetch_concurrent;
     }
     if (strcmp(name, "ggml_cuda_fork_prefetch_stop") == 0) {
         return (void *)ggml_cuda_fork_prefetch_stop;
