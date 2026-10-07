@@ -156,43 +156,52 @@ static __device__ void mk_quant(const mk_stage & s) {
 // q8_0 x q8_1 matrix-vector product, the values of mul_mat_vec_q<Q8_0, 1> on RDNA2 (one wave per row; also of its
 // k-split variant): per lane the contracted fma chain over its blocks in order, then the warp reduction
 static __device__ void mk_matvec(const mk_stage & s) {
-    constexpr int qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ, bpi = vdr*32/qi, U = 8;
+    constexpr int qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ, bpi = vdr*32/qi, U = 8, RW = 1;
     const int lane = threadIdx.x % 32, gw = blockIdx.x*MK_NW + threadIdx.x/32;
     const int bpr = s.n1 / QK8_0;
     const int kbx0 = lane / (qi/vdr), kqs = vdr * (lane % (qi/vdr));
     const int niter = (bpr - kbx0 + bpi - 1) / bpi;
     const block_q8_1 * y = (const block_q8_1 *) s.b;
     float * dst = (float *) s.x;
-    for (int row = gw; row < s.n0; row += gridDim.x*MK_NW) {
-        const block_q8_0 * x = (const block_q8_0 *) s.a + (size_t) row*bpr;
-        float tmp = 0.0f;
+    for (int row0 = gw*RW; row0 < s.n0; row0 += gridDim.x*MK_NW*RW) {
+        float tmp[RW] = {0.0f};
         for (int i0 = 0; i0 < niter; i0 += U) {
-            float f[U], sv[U];
+            float f[RW][U], sv[RW][U];
 #pragma unroll
-            for (int u = 0; u < U; ++u) {
-                if (i0 + u < niter) {
-                    const int kbx = kbx0 + (i0 + u)*bpi;
-                    int sumi = 0;
+            for (int r = 0; r < RW; ++r) {
+                const block_q8_0 * x = (const block_q8_0 *) s.a + (size_t) (row0 + r)*bpr;
 #pragma unroll
-                    for (int v = 0; v < vdr; ++v) {
-                        sumi = ggml_cuda_dp4a(get_int_b2(x[kbx].qs, kqs + v), get_int_b4(y[kbx].qs, kqs + v), sumi);
+                for (int u = 0; u < U; ++u) {
+                    if (row0 + r < s.n0 && i0 + u < niter) {
+                        const int kbx = kbx0 + (i0 + u)*bpi;
+                        int sumi = 0;
+#pragma unroll
+                        for (int v = 0; v < vdr; ++v) {
+                            sumi = ggml_cuda_dp4a(get_int_b2(x[kbx].qs, kqs + v), get_int_b4(y[kbx].qs, kqs + v), sumi);
+                        }
+                        const float d8_0 = x[kbx].d;
+                        const float d8_1 = __low2half(y[kbx].ds);
+                        f[r][u]  = d8_0*d8_1;
+                        sv[r][u] = (float) sumi;
                     }
-                    const float d8_0 = x[kbx].d;
-                    const float d8_1 = __low2half(y[kbx].ds);
-                    f[u]  = d8_0*d8_1;
-                    sv[u] = (float) sumi;
                 }
             }
 #pragma unroll
-            for (int u = 0; u < U; ++u) {
-                if (i0 + u < niter) {
-                    tmp = __fmaf_rn(f[u], sv[u], tmp);
+            for (int r = 0; r < RW; ++r) {
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    if (i0 + u < niter) {
+                        tmp[r] = __fmaf_rn(f[r][u], sv[r][u], tmp[r]);
+                    }
                 }
             }
         }
-        tmp = warp_reduce_sum<32>(tmp);
-        if (lane == 0) {
-            dst[row] = tmp;
+#pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const float t = warp_reduce_sum<32>(tmp[r]);
+            if (lane == 0 && row0 + r < s.n0) {
+                dst[row0 + r] = t;
+            }
         }
     }
 }
@@ -474,9 +483,13 @@ static __device__ void mk_router(const mk_stage & s, float * buf_iw, float * val
     __syncthreads();
     tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, buf_iw);
     const float inv_sum = 1.0f / tmp;
-    float * probs = (float *) s.x;
-    probs[tid] = vals[tid] * inv_sum;
+    float * probs_g = (float *) s.x;
+    const float pv = vals[tid] * inv_sum;
+    probs_g[tid] = pv;
     __syncthreads();
+    vals[tid] = pv;      // the sort reads the same values from shared memory
+    __syncthreads();
+    const float * probs = vals;
     // argsort (descending) of the probabilities just written
     dst_row[tid] = tid;
     __syncthreads();
@@ -643,7 +656,7 @@ bool mk_match_hc(mk_walker & w, const ggml_tensor * first, mk_builder & B, hc_ou
     const int niter_down = (int) ((ne/QK8_0 + 7)/8);
     if (n_lo > 1024 || niter_down < 8 || niter_down > 64) return false;                             // k-split path
     if (!mk_q8_0_mat(up->src[0], n_lo) || up->src[0]->ne[1] != ne || n_lo % QK8_1 != 0 || n_lo/QK8_1 > MK_MAXQB) return false;
-    if (!((n_lo/QK8_0 + 7)/8 <= 3 && ne > 1024 && ne % 16 == 0)) return false;                      // multirow path
+    if (!((n_lo/QK8_0 + 7)/8 <= 3 && ne > 1024 && ne % 16 == 0) || ne % (8*8) != 0) return false;    // multirow path (8 rows per wave here)
     if (!ggml_is_contiguous(up) || !ggml_is_contiguous(down) || ggml_get_op_params_i32(pre, 1) == 0) return false;   // gated
     const ggml_tensor * px = pre->src[0], * pw = pre->src[1];
     if (px->nb[0] != 4 || px->nb[1] != (size_t) n_embd*4 || pw->nb[0] != 4 || pw->nb[1] != (size_t) n_embd*4 || px->ne[2] != 1 || !ggml_is_contiguous(pre)) return false;
@@ -902,11 +915,19 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
         CUDA_CHECK(cudaMalloc(&bar, 2*sizeof(unsigned)));
         CUDA_CHECK(cudaMemset(bar, 0, 2*sizeof(unsigned)));
         CUDA_CHECK(cudaMalloc(&scratch, 1 << 20));
-        // the grid barrier needs every workgroup resident: 94 VGPRs -> 10 waves per SIMD -> at most 5 workgroups of 8
-        // waves per WGP (4 SIMDs; nsm counts WGPs on RDNA). Kernels of other streams can run alongside (copies, concurrent
-        // graph branches): with 4 or 5 per WGP some workgroups wait for them and tokens stall; 3 per WGP leaves room.
-        const int per_sm = getenv("LLAMA_LAYER_MK_PER_SM") ? atoi(getenv("LLAMA_LAYER_MK_PER_SM")) : 3;
-        grid = per_sm * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        // the grid barrier needs every workgroup resident. Per CU (2 SIMD32, 1024 VGPRs per lane each): waves per SIMD =
+        // 1024 / VGPRs (granule 8, at most 16), workgroups per CU = 2*that / 8 waves. Kernels of other streams can run
+        // alongside (copies, concurrent graph branches) and take slots: use 3/4 of the resident maximum.
+        hipFuncAttributes fa;
+        CUDA_CHECK(hipFuncGetAttributes(&fa, (const void *) layer_mk_kernel));
+        const int regs = std::max(8, (fa.numRegs + 7) / 8 * 8);
+        const int waves_simd = std::min(16, 1024 / regs);
+        const int per_cu = (2*waves_simd) / MK_NW;
+        const int n_cu = 2*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;   // nsm counts WGPs on RDNA
+        GGML_ASSERT(per_cu >= 1);
+        grid = std::max(1, (per_cu*n_cu*3)/4);
+        if (getenv("LLAMA_LAYER_MK_PER_SM")) grid = std::min(per_cu*n_cu, atoi(getenv("LLAMA_LAYER_MK_PER_SM"))*n_cu/2);
+        GGML_LOG_INFO("%s: layer megakernel: %d VGPRs, %d workgroups per CU resident, grid %d\n", __func__, fa.numRegs, per_cu, grid);
         if (getenv("LLAMA_LAYER_MK_GRID")) grid = std::min(grid, atoi(getenv("LLAMA_LAYER_MK_GRID")));
     }
     mk_builder B;
@@ -1013,13 +1034,15 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
         static std::vector<double> acc(MK_MAXST + 1, 0.0); static long calls = 0;
         unsigned long long h[MK_MAXST + 1];
         CUDA_CHECK(cudaMemcpyAsync(h, ts, sizeof(h), cudaMemcpyDeviceToHost, ctx.stream())); CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
-        if (p.n >= 20) {
+        if (p.n >= 55) {
             unsigned long long prev = h[0];
             for (int k = 0; k < p.n; k++) if (p.s[k].bar) { acc[k] += (h[1 + k] - prev)/100.0; prev = h[1 + k]; }
             if (++calls % 360 == 0) {
+                static const char * nm[] = {"post","rmsB","quant","mv","siluup","pre","conv","alpha","sig","sss","rmsS","gdn","copy","comb","mvf32","router"};
                 fprintf(stderr, "[layer-mk] grid %d, %d stages, us per call:", grid, p.n);
-                for (int k = 0; k < p.n; k++) if (p.s[k].bar) fprintf(stderr, " %d:%.1f", k, acc[k]/360);
-                fprintf(stderr, "\n");
+                double tot = 0, cp = 0;
+                for (int k = 0; k < p.n; k++) if (p.s[k].bar) { tot += acc[k]/360; if (p.s[k].op == MK_COPY) cp += acc[k]/360; else fprintf(stderr, " %s:%.1f", nm[p.s[k].op], acc[k]/360); }
+                fprintf(stderr, " | write-back %.1f, total %.1f\n", cp, tot);
                 std::fill(acc.begin(), acc.end(), 0.0);
             }
         }
