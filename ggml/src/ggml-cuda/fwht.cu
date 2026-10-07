@@ -126,3 +126,5 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
             return false;
     }
 }
+
+bool ggml_cuda_op_mul_mat_use_fwht_fork(const struct ggml_tensor * op) { return ggml_cuda_op_mul_mat_use_fwht(op); }   // (fork) layer-mk.cu

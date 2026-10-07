@@ -14,9 +14,12 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "convert.cuh"
 
 #include <vector>
 #include <algorithm>
+
+bool ggml_cuda_op_mul_mat_use_fwht_fork(const ggml_tensor * op);   // fwht.cu
 
 static std::vector<const ggml_tensor *> g_mk_check;   // LLAMA_MK_CHECK (debug)
 
@@ -28,6 +31,7 @@ static std::vector<const ggml_tensor *> g_mk_check;   // LLAMA_MK_CHECK (debug)
 enum mk_op : int {
     MK_HC_POST, MK_RMS_BIG, MK_QUANT, MK_MATVEC, MK_SILU_UP, MK_HC_PRE,
     MK_LIN_CONV, MK_ALPHA, MK_SIGMOID, MK_SSS, MK_RMS_SMALL, MK_GDN, MK_COPY, MK_COMBINE, MK_MATVEC_F32, MK_ROUTER,
+    MK_ROPE, MK_SET_ROWS, MK_CONT, MK_SIGMUL, MK_FWHT,
 };
 
 struct mk_stage {
@@ -344,7 +348,7 @@ static __device__ void mk_sss(const mk_stage & s) {
 static __device__ void mk_rms_small(const mk_stage & s, float * s_sum) {
     const int tid = mk_tid(), n = s.n0;
     for (int row = blockIdx.x; row < s.n1; row += gridDim.x) {
-        const float * x = (const float *) s.a + row*n;
+        const float * x = (const float *) s.a + row*(s.n3 ? s.n3 : n);
         float tmp = 0.0f;
         for (int col = tid; col < n; col += 256) {
             const float xi = x[col];
@@ -357,6 +361,8 @@ static __device__ void mk_rms_small(const mk_stage & s, float * s_sum) {
         for (int col = tid; col < n; col += 256) {
             if (s.n2 == 0) {
                 dst[col] = s.f1 * (scale * x[col]);
+            } else if (s.n2 == 2) {   // rms_norm_f32<256, true>: RMS_NORM + MUL
+                dst[col] = scale * x[col] * ((const float *) s.b)[col];
             } else {
                 const float nm = scale * x[col] * ((const float *) s.b)[col];
                 const float z  = ((const float *) s.c)[row*n + col];
@@ -531,6 +537,180 @@ static __device__ void mk_copy(const mk_stage & s) {   // n0 floats
     }
 }
 
+// rope_yarn / rope_yarn_ramp of rope.cu, literally
+static __device__ float mk_rope_yarn_ramp(const float low, const float high, const int i0) {
+    const float y = (i0 / 2 - low) / max(0.001f, high - low);
+    return 1.0f - min(1.0f, max(0.0f, y));
+}
+static __device__ void mk_rope_yarn(
+        const float theta_extrap, const float freq_scale, const float corr0, const float corr1, const int64_t i0, const float ext_factor,
+        float mscale, float & cos_theta, float & sin_theta) {
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = mk_rope_yarn_ramp(corr0, corr1, i0) * ext_factor;
+        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    cos_theta = cosf(theta) * mscale;
+    sin_theta = sinf(theta) * mscale;
+}
+
+// rope_multi<forward = true, f32> (one token): element pairs (row, i0) over the grid; the per-pair body of rope.cu
+// n0 ne00 | rows << 16, n1 n_dims | n_offs << 16, n2 s01 | s1 << 16 (row strides), n3 sections (8 bits each);
+// f0 freq_scale, f1 ext_factor, f2 attn_factor, f3 theta_scale; e corr dims (2 floats); d non-null: imrope;
+// a x, b pos, c freq_factors
+static __device__ void mk_rope(const mk_stage & s) {
+    const float * x = (const float *) s.a; float * dst = (float *) s.x; const int32_t * pos = (const int32_t *) s.b;
+    const float * freq_factors = (const float *) s.c;
+    const int ne00 = s.n0 & 0xffff, n_dims = s.n1 & 0xffff, n_offs = s.n1 >> 16, ne02 = 1, i2 = 0;
+    const int s01 = s.n2 & 0xffff, s1 = s.n2 >> 16;
+    const int npairs = ne00/2, ntot = npairs*(s.n0 >> 16);
+    const bool is_imrope = s.d != nullptr, inplace = false;
+    const int sec0 = s.n3 & 0xff, sec1 = (s.n3 >> 8) & 0xff, sec2 = (s.n3 >> 16) & 0xff, sec3 = (s.n3 >> 24) & 0xff;
+    float corr[2];
+    __builtin_memcpy(corr, &s.e, sizeof(corr));
+    for (int e = blockIdx.x*MK_NT + mk_tid(); e < ntot; e += gridDim.x*MK_NT) {
+        const int i0 = 2*(e % npairs), i1 = e / npairs;
+        const int idst = i0 / 2 + i1 * s1;
+        const int ix   = i0 / 2 + i1 * s01;
+        if (i0 < n_offs || i0 >= n_offs + n_dims) {
+            if (!inplace) {
+                dst[idst + i0/2 + 0] = x[ix + i0/2 + 0];
+                dst[idst + i0/2 + 1] = x[ix + i0/2 + 1];
+            }
+            continue;
+        }
+        const int iw = i0 - n_offs;
+        const int sect_dims = sec0 + sec1 + sec2 + sec3;
+        const int sec_w = sec1 + sec0;
+        const int sector = (iw / 2) % sect_dims;
+        const float theta_scale = s.f3;
+        float theta_base = 0.0;
+        if (is_imrope) {
+            if (sector % 3 == 1 && sector < 3 * sec1) {
+                theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            } else if (sector % 3 == 2 && sector < 3 * sec2) {
+                theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector % 3 == 0 && sector < 3 * sec0) {
+                theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+            } else {
+                theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            }
+        } else {
+            if (sector < sec0) {
+                theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sec0 && sector < sec_w) {
+                theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sec_w && sector < sec_w + sec2) {
+                theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sec_w + sec2) {
+                theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            }
+        }
+        const float freq_factor = freq_factors ? freq_factors[iw/2] : 1.0f;
+        float cos_theta;
+        float sin_theta;
+        mk_rope_yarn(theta_base/freq_factor, s.f0, corr[0], corr[1], iw, s.f1, s.f2, cos_theta, sin_theta);
+        const float x0 = x[ix + n_offs/2 + 0];
+        const float x1 = x[ix + n_offs/2 + n_dims/2];
+        dst[idst + n_offs/2 + 0]        = x0*cos_theta - x1*sin_theta;
+        dst[idst + n_offs/2 + n_dims/2] = x0*sin_theta + x1*cos_theta;
+    }
+}
+
+// SET_ROWS of one f32 row of n0 values into row idx (b: index, n3 1 = int64) of x (row stride n2 bytes):
+// n1 0 = f16 (ggml_cuda_cast), 1 = q8_0 (quantize_f32_q8_0_block)
+static __device__ void mk_set_rows(const mk_stage & s) {
+    const int64_t idx = s.n3 ? *(const int64_t *) s.b : (int64_t) *(const int32_t *) s.b;
+    char * row = (char *) s.x + idx*(int64_t) s.n2;
+    const float * src = (const float *) s.a;
+    if (s.n1 == 0) {
+        for (int i = blockIdx.x*MK_NT + mk_tid(); i < s.n0; i += gridDim.x*MK_NT) ((half *) row)[i] = ggml_cuda_cast<half>(src[i]);
+    } else {
+        // quantize_f32_q8_0_block, one wave per block: amax by a max reduction (exact in any order), then the same
+        // d = amax/127, id = 1/d (0 when d = 0), q = roundf(x*id)
+        const int lane = mk_tid() % 32;
+        for (int b = blockIdx.x*MK_NW + mk_tid()/32; b < s.n0/QK8_0; b += gridDim.x*MK_NW) {
+            const float v = src[b*QK8_0 + lane];
+            const float amax = warp_reduce_max<32>(fabsf(v));
+            const float d = amax / ((1 << 7) - 1);
+            const float id = d ? 1.0f/d : 0.0f;
+            block_q8_0 * y = (block_q8_0 *) row + b;
+            if (lane == 0) y->d = d;
+            const float x0 = v*id;
+            y->qs[lane] = roundf(x0);
+        }
+    }
+}
+
+// CONT of n1 rows of n0 floats with source row stride n2 (elements)
+static __device__ void mk_cont(const mk_stage & s) {
+    const float * a = (const float *) s.a; float * x = (float *) s.x;
+    for (int i = blockIdx.x*MK_NT + mk_tid(); i < s.n0*s.n1; i += gridDim.x*MK_NT) x[i] = a[(i / s.n0)*s.n2 + i % s.n0];
+}
+
+// SIGMOID + MUL (unary_gated_op_kernel<op_sigmoid>: op(x) * g; unfused: sigmoid rounded, then the product)
+static __device__ void mk_sigmul(const mk_stage & s) {
+    const float * xg = (const float *) s.a, * g = (const float *) s.b; float * d = (float *) s.x;
+    for (int i = blockIdx.x*MK_NT + mk_tid(); i < s.n0; i += gridDim.x*MK_NT) {
+        const float sg = 1.0f / (1.0f + expf(-xg[i]));
+        d[i] = sg * g[i];
+    }
+}
+
+// fwht_cuda<N, float> (Hadamard rotation of rows of N): one wave per row, the same lane registers and butterflies
+template <int N>
+static __device__ void mk_fwht_n(const mk_stage & s) {
+    constexpr int warp_size = 32, el_w = N / warp_size;
+    const int lane = mk_tid() % 32;
+    for (int r = blockIdx.x*MK_NW + mk_tid()/32; r < s.n0; r += gridDim.x*MK_NW) {
+        const float * src = (const float *) s.a + (int64_t) r*N;
+        float * dst = (float *) s.x + (int64_t) r*N;
+        const float scale = s.f0;
+        float reg[el_w];
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]) * scale;
+        }
+#pragma unroll
+        for (int h = 1; h < warp_size; h *= 2) {
+#pragma unroll
+            for (int j = 0; j < el_w; j++) {
+                const float val  = reg[j];
+                const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+                reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+            }
+        }
+#pragma unroll
+        for (int h = warp_size; h < N; h *= 2) {
+            const int step = h / warp_size;
+#pragma unroll
+            for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+                for (int k = 0; k < step; k++) {
+                    const float x = reg[j + k];
+                    const float y = reg[j + k + step];
+                    reg[j + k]        = x + y;
+                    reg[j + k + step] = x - y;
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            dst[i * warp_size + lane] = reg[i];
+        }
+    }
+}
+static __device__ void mk_fwht(const mk_stage & s) {
+    switch (s.n1) {
+        case 64:  mk_fwht_n<64>(s);  break;
+        case 128: mk_fwht_n<128>(s); break;
+        case 256: mk_fwht_n<256>(s); break;
+        default: break;
+    }
+}
+
 __launch_bounds__(MK_NT, 1)
 static __global__ void layer_mk_kernel(const mk_prog p) {
     __shared__ float s_red[32];
@@ -557,6 +737,11 @@ static __global__ void layer_mk_kernel(const mk_prog p) {
             case MK_COMBINE:   mk_combine(s);        break;
             case MK_MATVEC_F32: mk_matvec_f32(s, s_red); break;
             case MK_ROUTER:    mk_router(s, s_red, s_vals, s_idx); break;
+            case MK_ROPE:      mk_rope(s);           break;
+            case MK_SET_ROWS:  mk_set_rows(s);       break;
+            case MK_CONT:      mk_cont(s);           break;
+            case MK_SIGMUL:    mk_sigmul(s);         break;
+            case MK_FWHT:      mk_fwht(s);           break;
         }
         if (s.bar) {
             mk_grid_sync(p.bar);
@@ -767,6 +952,182 @@ bool mk_match_router(mk_walker & w, const hc_out & hc, mk_builder & B) {
     return true;
 }
 
+
+static bool mk_attn_dbg() { static int d = -1; if (d < 0) d = getenv("LLAMA_MK_ATTN_DBG") != nullptr; return d; }
+#define MK_AFAIL do { if (mk_attn_dbg()) fprintf(stderr, "[mk-attn] no match at line %d\n", __LINE__); return false; } while (0)
+// ---- full-attention layers (decode): the part before FLASH_ATTN_EXT and the part after it
+
+// RMS_NORM (+ MUL) + ROPE (imrope / mrope) of the q or k heads: stages, false if the shapes are not the supported ones
+// what: 1 = the RMS_NORM + MUL stage, 2 = the ROPE stage, 0 = match only
+bool mk_attn_norm_rope(mk_walker & w, const ggml_tensor * mm, mk_builder & B, int what, int bar, const ggml_tensor ** rope_out) {
+    auto jof = [&](const ggml_tensor * t) { for (int k = w.j; k >= 0; k--) if (w.g->nodes[k] == t) return k; return -1; };
+    const ggml_tensor * rn = w.next(), * ml = w.next(), * rp = w.next();
+    if (!rn || rn->op != GGML_OP_RMS_NORM || !mk_is(rn->src[0], mm) || !ml || ml->op != GGML_OP_MUL || ml->src[0] != rn ||
+        !rp || rp->op != GGML_OP_ROPE || rp->src[0] != ml) MK_AFAIL;
+    const ggml_tensor * v = rn->src[0];
+    const int64_t n = v->ne[0], rows = v->ne[1];
+    if (n != 256 || v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != 4 || v->nb[1] % 4 != 0 || !mk_vec(ml->src[1], n) ||
+        !ggml_is_contiguous(rn) || !ggml_is_contiguous(ml) || !ggml_is_contiguous(rp) || rp->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(rp, ml)) MK_AFAIL;
+    const int mode = ((const int32_t *) rp->op_params)[2];
+    if (!(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION || rp->src[1]->type != GGML_TYPE_I32 ||
+        ggml_nelements(rp->src[1]) != 4) MK_AFAIL;
+    float eps; memcpy(&eps, rn->op_params, sizeof(float));
+    *rope_out = rp;
+    if (what == 1) { mk_stage & s = B.add(MK_RMS_SMALL, bar); s.a = B.in(v); s.b = ml->src[1]->data; s.n0 = (int) n; s.n1 = (int) rows; s.n2 = 2;
+      s.n3 = (int) (v->nb[1]/4); s.f0 = eps; s.x = B.out(jof(ml), ml, ggml_nbytes(ml)); }
+    if (what != 2) return true;
+    const int32_t * op = (const int32_t *) rp->op_params;
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base, op + 5, 4); memcpy(&freq_scale, op + 6, 4); memcpy(&ext_factor, op + 7, 4);
+    memcpy(&attn_factor, op + 8, 4); memcpy(&beta_fast, op + 9, 4); memcpy(&beta_slow, op + 10, 4);
+    float corr[2];
+    ggml_rope_yarn_corr_dims(op[1], op[4], freq_base, beta_fast, beta_slow, corr);
+    mk_stage & s = B.add(MK_ROPE, bar);
+    s.a = B.in(ml); s.b = rp->src[1]->data; s.c = rp->src[2] ? rp->src[2]->data : nullptr;
+    const int s01 = (int) (ml->nb[1]/4), s1 = (int) (rp->nb[1]/4);
+    if (rows > 0xffff || op[1] > 0xffff || op[15] < 0 || op[15] > 0x7fff || s01 > 0xffff || s1 > 0x7fff) MK_AFAIL;
+    for (int k = 11; k < 15; k++) if (op[k] < 0 || op[k] > 255) MK_AFAIL;
+    s.n0 = (int) n | (int) rows << 16; s.n1 = op[1] | op[15] << 16; s.n2 = s01 | s1 << 16;
+    s.n3 = op[11] | op[12] << 8 | op[13] << 16 | op[14] << 24;
+    s.f0 = freq_scale; s.f1 = ext_factor; s.f2 = attn_factor; s.f3 = powf(freq_base, -2.0f / op[1]);
+    __builtin_memcpy((void *) &s.e, corr, sizeof(corr));
+    s.d = mode == GGML_ROPE_TYPE_IMROPE ? (const void *) 1 : nullptr;
+    s.x = B.out(jof(rp), rp, ggml_nbytes(rp));
+    return true;
+}
+
+// optional Hadamard rotation (quantized KV cache): MUL_MAT with the hadamard hint on src1 = (view of) t
+const ggml_tensor * mk_fwht_node(const ggml_tensor * n, const ggml_tensor * t) {
+    if (!n || n->op != GGML_OP_MUL_MAT || !mk_is(n->src[1], t) || !ggml_cuda_op_mul_mat_use_fwht_fork(n) || n->src[1]->type != GGML_TYPE_F32) return nullptr;
+    const int64_t N = n->ne[0];
+    if ((N != 64 && N != 128 && N != 256) || !ggml_is_contiguous(n->src[1])) return nullptr;
+    return n;
+}
+void mk_fwht_stage(const ggml_tensor * n, mk_builder & B, int j, int bar) {
+    mk_stage & s = B.add(MK_FWHT, bar);
+    s.a = B.in(n->src[1]); s.n1 = (int) n->ne[0]; s.n0 = (int) ggml_nrows(n); s.f0 = 1 / sqrtf((float) n->ne[0]);
+    s.x = B.out(j, n, ggml_nbytes(n));
+}
+
+bool mk_set_rows_stage(const ggml_tensor * sr, const ggml_tensor * src, mk_builder & B, int bar) {
+    if (!sr || sr->op != GGML_OP_SET_ROWS || !mk_is(sr->src[0], src) || ggml_nelements(sr->src[0]) != ggml_nelements(src) ||
+        sr->src[0]->ne[1] != 1 || (sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_Q8_0) || sr->ne[0] != src->ne[0]*src->ne[1] ||
+        ggml_nelements(sr->src[1]) != 1 || (sr->src[1]->type != GGML_TYPE_I64 && sr->src[1]->type != GGML_TYPE_I32) ||
+        sr->ne[0] % QK8_0 != 0 || !ggml_is_contiguous(src) || sr->nb[1] > INT32_MAX) MK_AFAIL;
+    mk_stage & s = B.add(MK_SET_ROWS, bar);
+    s.a = B.in(sr->src[0]); s.b = sr->src[1]->data; s.x = sr->data; s.n0 = (int) sr->ne[0]; s.n1 = sr->type == GGML_TYPE_Q8_0;
+    s.n2 = (int) sr->nb[1]; s.n3 = sr->src[1]->type == GGML_TYPE_I64;
+    return true;
+}
+
+// after the attention HC chain: q (with gate), k, v products, q/k norms and rope, (Hadamard rotations of q, k, v for
+// a quantized cache), k/v rows into the cache
+bool mk_match_attn_a(mk_walker & w, const hc_out & hc, mk_builder & B) {
+    auto jof = [&](const ggml_tensor * t) { for (int k = w.j; k >= 0; k--) if (w.g->nodes[k] == t) return k; return -1; };
+    const ggml_tensor * mixed = hc.mixed;
+    const int64_t n_embd = mixed->ne[0];
+    auto is_mv = [&](const ggml_tensor * t) { return t && t->op == GGML_OP_MUL_MAT && t->src[1] == mixed && mk_q8_0_mat(t->src[0], n_embd) && mk_vec(t, t->ne[0]); };
+    const ggml_tensor * q = w.next();
+    if (!is_mv(q)) MK_AFAIL;
+    const int j_q = w.j;
+    const ggml_tensor * rope_q = nullptr, * rope_k = nullptr, * t = nullptr;
+    if (!mk_attn_norm_rope(w, q, B, 0, 0, &rope_q)) MK_AFAIL;
+    mk_walker wp = w;
+    const ggml_tensor * rot_q = mk_fwht_node(w.next(), rope_q);
+    if (!rot_q) w = wp;
+    const ggml_tensor * v = w.next();
+    if (!is_mv(v)) MK_AFAIL;
+    wp = w;
+    const ggml_tensor * rot_v = mk_fwht_node(w.next(), v);
+    if (!rot_v) w = wp;
+    const ggml_tensor * k = w.next();
+    if (!is_mv(k)) MK_AFAIL;
+    const int j_k = w.j;
+    if (!mk_attn_norm_rope(w, k, B, 0, 0, &rope_k)) MK_AFAIL;
+    wp = w;
+    const ggml_tensor * rot_k = mk_fwht_node(w.next(), rope_k);
+    if (!rot_k) w = wp;
+    if ((rot_q != nullptr) != (rot_k != nullptr) || (rot_q != nullptr) != (rot_v != nullptr)) MK_AFAIL;
+    const ggml_tensor * sk = w.next();
+    const ggml_tensor * sv = w.next();
+    const ggml_tensor * fa = nullptr;
+    for (int k2 = w.j + 1; k2 < w.g->n_nodes; k2++) {   // only views until the attention
+        const ggml_tensor * tt = w.g->nodes[k2];
+        if (tt->op == GGML_OP_FLASH_ATTN_EXT) { fa = tt; break; }
+        if (tt->op != GGML_OP_VIEW && tt->op != GGML_OP_PERMUTE && tt->op != GGML_OP_RESHAPE && tt->op != GGML_OP_TRANSPOSE) MK_AFAIL;
+    }
+    if (!fa) MK_AFAIL;
+    const int j_end = w.j;
+    // stages: products; norms (+ v rotation); ropes; q/k rotations; cache rows
+    void * qm = B.alloc((size_t) n_embd/QK8_1*sizeof(block_q8_1));
+    { mk_stage & s = B.add(MK_QUANT); s.a = B.in(mixed); s.x = qm; s.n0 = (int) n_embd; }
+    w.j = j_end;
+    { mk_stage & s = B.add(MK_MATVEC, 0); s.a = q->src[0]->data; s.b = qm; s.n0 = (int) q->ne[0]; s.n1 = (int) n_embd; s.x = B.out(jof(q), q, ggml_nbytes(q)); }
+    { mk_stage & s = B.add(MK_MATVEC, 0); s.a = v->src[0]->data; s.b = qm; s.n0 = (int) v->ne[0]; s.n1 = (int) n_embd; s.x = B.out(jof(v), v, ggml_nbytes(v)); }
+    { mk_stage & s = B.add(MK_MATVEC);    s.a = k->src[0]->data; s.b = qm; s.n0 = (int) k->ne[0]; s.n1 = (int) n_embd; s.x = B.out(jof(k), k, ggml_nbytes(k)); }
+    { mk_walker wr{w.g, j_q}; if (!mk_attn_norm_rope(wr, q, B, 1, 0, &t)) MK_AFAIL; }
+    if (rot_v) mk_fwht_stage(rot_v, B, jof(rot_v), 0);
+    { mk_walker wr{w.g, j_k}; if (!mk_attn_norm_rope(wr, k, B, 1, 1, &t)) MK_AFAIL; }
+    { mk_walker wr{w.g, j_q}; if (!mk_attn_norm_rope(wr, q, B, 2, 0, &t)) MK_AFAIL; }
+    { mk_walker wr{w.g, j_k}; if (!mk_attn_norm_rope(wr, k, B, 2, 1, &t)) MK_AFAIL; }
+    if (rot_q) { mk_fwht_stage(rot_q, B, jof(rot_q), 0); mk_fwht_stage(rot_k, B, jof(rot_k), 1); }
+    if (!mk_set_rows_stage(sk, rot_k ? rot_k : rope_k, B, 0)) MK_AFAIL;
+    if (!mk_set_rows_stage(sv, rot_v ? rot_v : v, B, 1)) MK_AFAIL;
+    return true;
+}
+
+// after FLASH_ATTN_EXT: gate (CONT of q's gate half, SIGMOID, MUL), output product, hc inject (+ scale, sigmoid, scale)
+bool mk_match_attn_b(mk_walker & w, const ggml_tensor * ct, mk_builder & B, const ggml_tensor ** x_out) {
+    auto jof = [&](const ggml_tensor * t) { for (int k = w.j; k >= 0; k--) if (w.g->nodes[k] == t) return k; return -1; };
+    const ggml_tensor * rot_o = nullptr;   // inverse rotation of the attention output (quantized cache)
+    if (ct->op == GGML_OP_MUL_MAT) {
+        if (!ggml_cuda_op_mul_mat_use_fwht_fork(ct) || ct->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(ct->src[1]) ||
+            (ct->ne[0] != 64 && ct->ne[0] != 128 && ct->ne[0] != 256)) MK_AFAIL;
+        rot_o = ct;
+        ct = w.next();
+        if (!ct) MK_AFAIL;
+    }
+    if (ct->op != GGML_OP_CONT || ct->type != GGML_TYPE_F32) MK_AFAIL;
+    const ggml_tensor * cv = ct->src[0];
+    if (cv->type != GGML_TYPE_F32 || cv->nb[0] != 4 || cv->ne[2] != 1 || cv->ne[3] != 1 || cv->nb[1] % 4 != 0 || !ggml_is_contiguous(ct)) MK_AFAIL;
+    const ggml_tensor * sg = w.next(), * ml = w.next();
+    if (!sg || sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID || sg->src[0] != ct || !ggml_is_contiguous(sg) ||
+        !ml || ml->op != GGML_OP_MUL || (ml->src[0] != sg && ml->src[1] != sg)) MK_AFAIL;
+    const ggml_tensor * other = ml->src[0] == sg ? ml->src[1] : ml->src[0];
+    const int64_t n = ggml_nelements(ct);
+    if (ggml_nelements(other) != n || !ggml_is_contiguous(other) || other->type != GGML_TYPE_F32 || !mk_vec(ml, n)) MK_AFAIL;
+    if (rot_o && !mk_is(other, rot_o)) MK_AFAIL;
+    const ggml_tensor * out = w.next();
+    if (!out || out->op != GGML_OP_MUL_MAT || !mk_is(out->src[1], ml) || !mk_q8_0_mat(out->src[0], n) || out->ne[1] != 1) MK_AFAIL;
+    const ggml_tensor * inj = w.next();
+    if (!inj || inj->op != GGML_OP_MUL_MAT || inj->src[0]->type != GGML_TYPE_Q8_0) MK_AFAIL;
+    const ggml_tensor * hcn = inj->src[1];
+    const int64_t K = ggml_nelements(hcn);
+    if (!mk_q8_0_mat(inj->src[0], K) || !ggml_is_contiguous(hcn) || hcn->type != GGML_TYPE_F32 || K % 512 != 0) MK_AFAIL;
+    const int64_t niter_inj = (K/QK8_0 + 7)/8;
+    if (inj->ne[0] > 1024 || niter_inj < 8 || niter_inj > 64) MK_AFAIL;
+    const ggml_tensor * s1 = w.next(), * sg2 = w.next(), * s2 = w.next();
+    if (!s1 || s1->op != GGML_OP_SCALE || s1->src[0] != inj || !sg2 || sg2->op != GGML_OP_UNARY || ggml_get_unary_op(sg2) != GGML_UNARY_OP_SIGMOID ||
+        sg2->src[0] != s1 || !s2 || s2->op != GGML_OP_SCALE || s2->src[0] != sg2 || !mk_vec(s2, inj->ne[0])) MK_AFAIL;
+    const size_t f4 = sizeof(float);
+    if (rot_o) mk_fwht_stage(rot_o, B, jof(rot_o), 0);
+    { mk_stage & s = B.add(MK_CONT, 0); s.a = B.in(cv); s.n0 = (int) cv->ne[0]; s.n1 = (int) cv->ne[1]; s.n2 = (int) (cv->nb[1]/4);
+      s.x = B.out(jof(ct), ct, n*f4); }
+    void * xq = B.alloc((size_t) K/QK8_1*sizeof(block_q8_1));
+    { mk_stage & s = B.add(MK_QUANT); s.a = B.in(hcn); s.x = xq; s.n0 = (int) K; }
+    { mk_stage & s = B.add(MK_SIGMUL); s.a = B.in(ct); s.b = B.in(other); s.n0 = (int) n; s.x = B.out(jof(ml), ml, n*f4); }
+    void * qf = B.alloc((size_t) n/QK8_1*sizeof(block_q8_1));
+    { mk_stage & s = B.add(MK_QUANT); s.a = B.in(ml); s.x = qf; s.n0 = (int) n; }
+    { mk_stage & s = B.add(MK_MATVEC, 0); s.a = out->src[0]->data; s.b = qf; s.n0 = (int) out->ne[0]; s.n1 = (int) n; s.x = B.out(jof(out), out, out->ne[0]*f4); }
+    { mk_stage & s = B.add(MK_MATVEC);    s.a = inj->src[0]->data; s.b = xq; s.n0 = (int) inj->ne[0]; s.n1 = (int) K; s.x = B.out(jof(inj), inj, inj->ne[0]*f4); }
+    { mk_stage & s = B.add(MK_SSS);       s.a = B.in(inj); s.n0 = (int) inj->ne[0];
+      s.f0 = ggml_get_op_params_f32(s1, 0); s.f1 = ggml_get_op_params_f32(s1, 1); s.f2 = ggml_get_op_params_f32(s2, 0); s.f3 = ggml_get_op_params_f32(s2, 1);
+      s.x = B.out(jof(s2), s2, inj->ne[0]*f4); }
+    *x_out = out;
+    return true;
+}
+
 // linear attention after an HC chain (mixed = its output, xn/xq = its normed input and q8_1)
 struct lin_cut { int j = -1; size_t nst = 0; const ggml_tensor * sgr = nullptr; };
 
@@ -913,7 +1274,8 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
         getenv("LLAMA_MMVQ_MULTIROW_R") || getenv("LLAMA_MMVQ_MULTIROW_MAXITER") || getenv("LLAMA_NO_SSM_FUSE");
     static const int level = getenv("LLAMA_LAYER_MK") ? atoi(getenv("LLAMA_LAYER_MK")) : 2;   // 1: HC chains only
     const ggml_tensor * n0 = g->nodes[i];
-    if (off || (n0->op != GGML_OP_DSV4_HC_POST && n0->op != GGML_OP_RMS_NORM && n0->op != GGML_OP_ADD && n0->op != GGML_OP_MUL) ||
+    if (off || (n0->op != GGML_OP_DSV4_HC_POST && n0->op != GGML_OP_RMS_NORM && n0->op != GGML_OP_ADD && n0->op != GGML_OP_MUL &&
+                n0->op != GGML_OP_CONT && n0->op != GGML_OP_MUL_MAT) ||
         ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32 || ctx.curr_stream_no != 0) {
         return 0;
     }
@@ -943,8 +1305,14 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
     B.scratch = scratch;
     mk_walker w{g, i - 1};
     static const bool comb_on = !getenv("LLAMA_MK_NO_COMBINE"), router_on = !getenv("LLAMA_MK_NO_ROUTER");
+    static const bool attn_on = getenv("LLAMA_MK_ATTN") && atoi(getenv("LLAMA_MK_ATTN")) > 0;   // (fork) full-attention layers
     const ggml_tensor * first = w.next();
-    if (first && (first->op == GGML_OP_ADD || first->op == GGML_OP_MUL)) {
+    if (first && (first->op == GGML_OP_CONT || first->op == GGML_OP_MUL_MAT)) {   // full attention, after FLASH_ATTN_EXT: gate, output, inject, then the HC chain
+        const ggml_tensor * xo = nullptr;
+        if (!attn_on || !mk_match_attn_b(w, first, B, &xo)) return 0;
+        first = w.next();
+        if (!first || first->op != GGML_OP_DSV4_HC_POST || !mk_is(first->src[0], xo)) return 0;
+    } else if (first && (first->op == GGML_OP_ADD || first->op == GGML_OP_MUL)) {
         if (!comb_on || !mk_match_combine(w, first, B)) return 0;
         first = w.next();
         if (!first || first->op != GGML_OP_DSV4_HC_POST) return 0;
@@ -977,6 +1345,12 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
                 B = B3; last = w3.j; hc_last = hc2;
             } else if (B2.st.size() <= MK_MAXST) {
                 B = B2; last = w2.j;
+            }
+        } else if (level == 2 && attn_on) {   // full attention: everything up to FLASH_ATTN_EXT
+            mk_builder B5 = B;
+            mk_walker w5 = w;
+            if (mk_match_attn_a(w5, hc, B5) && B5.st.size() <= MK_MAXST) {
+                B = B5; last = w5.j;
             }
         }
     }

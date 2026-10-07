@@ -3558,7 +3558,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
     // fork: hyper-connection chains and linear attention in one persistent kernel (layer-mk.cu)
-    if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+    if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD || node->op == GGML_OP_MUL ||
+        node->op == GGML_OP_CONT || node->op == GGML_OP_MUL_MAT) {
         const int n = ggml_cuda_try_layer_mk(*cuda_ctx, cgraph, i);
         if (n > 0) {
             return n;
