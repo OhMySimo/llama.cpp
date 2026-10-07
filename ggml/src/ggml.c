@@ -155,6 +155,23 @@ static void ggml_print_backtrace_symbols(void) {
 }
 #endif
 
+// (fork) GGML_SEGV_BACKTRACE=1: print a backtrace (gdb attach, as for GGML_ABORT) on SIGSEGV/SIGBUS
+#if defined(__linux__)
+#include <signal.h>
+static void ggml_segv_handler(int sig) {
+    fprintf(stderr, "\n[ggml] caught signal %d, backtrace:\n", sig);
+    ggml_print_backtrace();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+__attribute__((constructor)) static void ggml_segv_install(void) {
+    if (getenv("GGML_SEGV_BACKTRACE")) {
+        signal(SIGSEGV, ggml_segv_handler);
+        signal(SIGBUS,  ggml_segv_handler);
+    }
+}
+#endif
+
 void ggml_print_backtrace(void) {
     const char * GGML_NO_BACKTRACE = getenv("GGML_NO_BACKTRACE");
     if (GGML_NO_BACKTRACE) {

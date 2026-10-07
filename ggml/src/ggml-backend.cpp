@@ -1908,7 +1908,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else if (!(batch_cpy && ggml_backend_buffer_is_host(input->buffer) && !ggml_backend_buffer_is_host(input_cpy->buffer) &&
                              split_backend->iface.set_tensor_async && ggml_is_contiguous(input) &&
                              ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
-                             !(split->graph.n_nodes > 0 && split->graph.nodes[0]->op == GGML_OP_MUL_MAT_ID))) {
+                             ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
                     // (fork) not for the queued host -> device copy below: it runs on the split backend's own stream,
                     // after everything already queued there, so the host need not wait for the GPU here
                     ggml_backend_synchronize(split_backend);

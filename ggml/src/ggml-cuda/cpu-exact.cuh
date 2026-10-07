@@ -13,3 +13,6 @@ void ggml_cuda_mul_mat_id_cpu_exact(ggml_backend_cuda_context & ctx, ggml_tensor
 
 // GLU (SWIGLU, split or not) flagged CPU_EXACT
 void ggml_cuda_swiglu_cpu_exact(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// MUL_MAT_ID gate + MUL_MAT_ID up + SWIGLU (all CPU_EXACT) in one kernel; false if the pattern does not fit
+bool ggml_cuda_moe_gate_up_swiglu_cpu_exact(ggml_backend_cuda_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * glu);

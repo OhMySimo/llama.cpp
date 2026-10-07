@@ -1286,7 +1286,13 @@ struct ecache_state {
     int every = 32, max_swaps = 24;
     gguf_context * gctx = nullptr; int fd = -1; size_t data_off = 0;   // source bytes when the CPU copy is repacked
     std::vector<uint8_t> tmp;
+    const void * sig = nullptr;   // data pointer of a weight of the model: a probe model freed before the real one
+                                  // was loaded can leave the same llama_model address
 };
+static const void * ecache_sig(const llama_model & model) {
+    for (const auto & l : model.layers) if (l.ffn_down_exps_t2) return l.ffn_down_exps_t2->data;
+    return nullptr;
+}
 ecache_state g_ec;
 
 bool ecache_hook(const ggml_tensor * src0, int32_t e, int64_t n_rows, bool count, void *) {
@@ -1362,7 +1368,7 @@ void ecache_init(const llama_model & model) {
     const char * prof = getenv("LLAMA_EXPERT_CACHE");
     if (!prof) { g_ec.tried = true; return; }
     for (const auto & l : model.layers) {           // a memory-fit probe model has no weights: wait for the real one
-        if (l.ffn_down_exps_t2 && !l.ffn_down_exps_t2->buffer) return;
+        if (l.ffn_down_exps_t2 && (!l.ffn_down_exps_t2->buffer || !l.ffn_down_exps_t2->data)) return;
     }
     if (g_ec.buf) ggml_backend_buffer_free(g_ec.buf);
     if (g_ec.ctx) ggml_free(g_ec.ctx);
@@ -1370,6 +1376,7 @@ void ecache_init(const llama_model & model) {
     if (g_ec.fd >= 0) close(g_ec.fd);
     g_ec = ecache_state();
     g_ec.model = &model;
+    g_ec.sig   = ecache_sig(model);
     g_ec.tried = true;
     const double budget = (getenv("LLAMA_EXPERT_CACHE_MB") ? atof(getenv("LLAMA_EXPERT_CACHE_MB")) : 2048.0) * 1048576.0;
     if (getenv("LLAMA_EXPERT_CACHE_EVERY")) g_ec.every     = std::max(1, atoi(getenv("LLAMA_EXPERT_CACHE_EVERY")));
@@ -1527,7 +1534,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
     }
     ggml_tensor * self = ggml_cast(ctx0, sel, GGML_TYPE_F32);
     ggml_tensor * x    = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tok);
-    if (!g_ec.tried || g_ec.model != &model) ecache_init(model);
+    if (!g_ec.tried || g_ec.model != &model || g_ec.sig != ecache_sig(model)) ecache_init(model);
     if (g_tm.model != &model) tier_maps_init(model);
     const bool lookup = g_tm.model == &model && !getenv("LLAMA_TIER_ARITH");   // 2 ops per group instead of ~10
     ggml_tensor * sel_flat0 = lookup ? ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok) : nullptr;

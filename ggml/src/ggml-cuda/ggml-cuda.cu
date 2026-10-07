@@ -3468,6 +3468,20 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    {   // (fork) CPU-exact expert block: gate + up + swiglu in one kernel (same arithmetic)
+        ggml_tensor * n0 = cgraph->nodes[i];
+        static const bool cx_fuse = !getenv("LLAMA_CX_NOFUSE");
+        if (cx_fuse && n0->op == GGML_OP_MUL_MAT_ID && (n0->src[0]->flags & GGML_TENSOR_FLAG_CPU_EXACT) && i + 2 < cgraph->n_nodes) {
+            ggml_tensor * n1 = cgraph->nodes[i + 1];
+            ggml_tensor * n2 = cgraph->nodes[i + 2];
+            if (n1->op == GGML_OP_MUL_MAT_ID && (n1->src[0]->flags & GGML_TENSOR_FLAG_CPU_EXACT) &&
+                n2->op == GGML_OP_GLU && (n2->flags & GGML_TENSOR_FLAG_CPU_EXACT) && ggml_get_glu_op(n2) == GGML_GLU_OP_SWIGLU &&
+                ggml_node_has_n_uses(cgraph, i, 1) && ggml_node_has_n_uses(cgraph, i + 1, 1) &&
+                ggml_cuda_moe_gate_up_swiglu_cpu_exact(*cuda_ctx, n0, n1, n2)) {
+                return 2;
+            }
+        }
+    }
     {   // (fork) CPU-exact expert products must run as their own ops
         const ggml_tensor * n0 = cgraph->nodes[i];
         if ((n0->flags & GGML_TENSOR_FLAG_CPU_EXACT) || (n0->op == GGML_OP_MUL_MAT_ID && (n0->src[0]->flags & GGML_TENSOR_FLAG_CPU_EXACT))) {
