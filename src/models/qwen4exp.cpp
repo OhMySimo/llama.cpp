@@ -4,6 +4,11 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <cmath>
 #include <array>
 #include <fstream>
 #include <unordered_map>
@@ -1230,6 +1235,11 @@ struct ecache_group {
     std::vector<int>   expert_in;                           // slot -> local expert
     std::vector<float> score;                               // decayed uses per local expert
     std::vector<float> mapv;
+    // (async adaptation) uses of each local expert in the last 16 / 64 / 256 / 1024 tokens, a prior from the
+    // profile, and the slot -> expert being copied in the background (-1 = none)
+    std::vector<float> cnt[4];
+    std::vector<float> prior;
+    std::vector<int>   pending_in;
 };
 struct tier_maps {     // (fork) per tiered layer: global expert id -> group-local id, or the group's zero dummy
     const llama_model * model = nullptr;
@@ -1286,6 +1296,9 @@ struct ecache_state {
     int every = 32, max_swaps = 24;
     gguf_context * gctx = nullptr; int fd = -1; size_t data_off = 0;   // source bytes when the CPU copy is repacked
     std::vector<uint8_t> tmp;
+    std::vector<std::vector<int32_t>> ring;   // events (gid << 16 | expert) of the last 1024 tokens
+    std::vector<int32_t> cur_ev;              // events of the token being computed
+    int64_t ring_tok = 0;
     const void * sig = nullptr;   // data pointer of a weight of the model: a probe model freed before the real one
                                   // was loaded can leave the same llama_model address
 };
@@ -1310,6 +1323,7 @@ bool ecache_hook(const ggml_tensor * src0, int32_t e, int64_t n_rows, bool count
     if (count) {
         if (strstr(src0->name, "ffn_gate_exps")) {   // gate only: one count per routed slot
             g.score[e] += (float) n_rows;
+            g_ec.cur_ev.push_back((int32_t) ((it->second.first*2 + it->second.second) << 16 | e));
             g_ec.uses += n_rows; if (g.slot_of[e] >= 0) g_ec.hits += n_rows;
         }
         return false;
@@ -1350,6 +1364,15 @@ const uint8_t * ecache_src(const ggml_tensor * t, int e) {
     return pread(g_ec.fd, g_ec.tmp.data(), nb, off) == (ssize_t) nb ? g_ec.tmp.data() : nullptr;
 }
 
+bool ecache_read(const ggml_tensor * t, int e, uint8_t * dst) {   // the expert's bytes, read from the model file
+    const size_t nb = ecache_expert_bytes(t);
+    if (!g_ec.gctx && !ecache_src(t, e)) return false;   // opens the file on first use
+    const int64_t ti = gguf_find_tensor(g_ec.gctx, t->name);
+    if (ti < 0) return false;
+    const off_t off = (off_t) (g_ec.data_off + gguf_get_tensor_offset(g_ec.gctx, ti) + (size_t) e * nb);
+    return pread(g_ec.fd, dst, nb, off) == (ssize_t) nb;
+}
+
 bool ecache_load_expert(ecache_group & g, int slot, int e) {
     for (int r = 0; r < 3; r++) {
         const uint8_t * src = ecache_src(g.base[r], e);
@@ -1362,6 +1385,7 @@ bool ecache_load_expert(ecache_group & g, int slot, int e) {
 // LLAMA_EXPERT_CACHE_EXACT (default 1): the cached experts run with the CUDA kernels that reproduce the CPU's
 // arithmetic (GGML_TENSOR_FLAG_CPU_EXACT), only for single-token steps (the CPU's own path for those): outputs are
 // identical to an all-CPU run. 0: llama.cpp's GPU kernels, faster to write but numerically different
+void ecache_quiesce();
 static bool ecache_exact() { static const bool on = !getenv("LLAMA_EXPERT_CACHE_EXACT") || atoi(getenv("LLAMA_EXPERT_CACHE_EXACT")) != 0; return on; }
 
 void ecache_init(const llama_model & model) {
@@ -1370,6 +1394,7 @@ void ecache_init(const llama_model & model) {
     for (const auto & l : model.layers) {           // a memory-fit probe model has no weights: wait for the real one
         if (l.ffn_down_exps_t2 && (!l.ffn_down_exps_t2->buffer || !l.ffn_down_exps_t2->data)) return;
     }
+    ecache_quiesce();   // no background copy may still target the old cache
     if (g_ec.buf) ggml_backend_buffer_free(g_ec.buf);
     if (g_ec.ctx) ggml_free(g_ec.ctx);
     if (g_ec.gctx) gguf_free(g_ec.gctx);
@@ -1379,6 +1404,10 @@ void ecache_init(const llama_model & model) {
     g_ec.sig   = ecache_sig(model);
     g_ec.tried = true;
     const double budget = (getenv("LLAMA_EXPERT_CACHE_MB") ? atof(getenv("LLAMA_EXPERT_CACHE_MB")) : 2048.0) * 1048576.0;
+    {   // asynchronous adaptation (default): frequent, many swaps; synchronous: rare, few
+        const bool async = !getenv("LLAMA_EXPERT_CACHE_ASYNC") || atoi(getenv("LLAMA_EXPERT_CACHE_ASYNC")) != 0;
+        g_ec.every = async ? 8 : 32; g_ec.max_swaps = async ? 96 : 24;
+    }
     if (getenv("LLAMA_EXPERT_CACHE_EVERY")) g_ec.every     = std::max(1, atoi(getenv("LLAMA_EXPERT_CACHE_EVERY")));
     if (getenv("LLAMA_EXPERT_CACHE_SWAPS")) g_ec.max_swaps = std::max(0, atoi(getenv("LLAMA_EXPERT_CACHE_SWAPS")));
     ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -1396,7 +1425,8 @@ void ecache_init(const llama_model & model) {
             ecache_group & g = g_ec.L[il][gi];
             for (int r = 0; r < 3; r++) g.base[r] = t[gi][r];
             g.lo = lo; g.n = (int) t[gi][2]->ne[2] - 1; lo += g.n;
-            g.slot_of.assign(g.n, -1); g.score.assign(g.n, 0.0f);
+            g.slot_of.assign(g.n, -1); g.score.assign(g.n, 0.0f); g.prior.assign(g.n, 0.0f);
+            for (auto & c : g.cnt) c.assign(g.n, 0.0f);
             for (int r = 0; r < 3; r++) { g_ec.by_base[t[gi][r]] = {il, gi}; g_ec.by_name[t[gi][r]->name] = {il, gi}; }
         }
     }
@@ -1414,6 +1444,7 @@ void ecache_init(const llama_model & model) {
         const double b = (double) ecache_expert_bytes(g.base[0]) + ecache_expert_bytes(g.base[1]) + ecache_expert_bytes(g.base[2]);
         cs.push_back({il, gr - 1, e, u, b});
         g.score[e] = (float) (u * 1e-3);       // a weak prior: runtime counts take over quickly
+        g.prior[e] = (float) log1p(u);
     }
     std::sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.uses / a.bytes > b.uses / b.bytes; });
     double used = 0;
@@ -1438,7 +1469,7 @@ void ecache_init(const llama_model & model) {
     g_ec.buf = ggml_backend_alloc_ctx_tensors_from_buft(g_ec.ctx, ggml_backend_dev_buffer_type(gpu));
     if (!g_ec.buf) { fprintf(stderr, "%s: could not allocate %.0f MB of VRAM, expert cache off\n", __func__, used / 1048576.0); return; }
     ggml_backend_buffer_set_usage(g_ec.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    for (auto & lg : g_ec.L) for (auto & g : lg) if (g.cap > 0) g.expert_in.assign(g.cap, -1);
+    for (auto & lg : g_ec.L) for (auto & g : lg) if (g.cap > 0) { g.expert_in.assign(g.cap, -1); g.pending_in.assign(g.cap, -1); }
     for (const cand & c : pick) {
         ecache_group & g = g_ec.L[c.il][c.gi];
         int slot = 0; while (g.expert_in[slot] >= 0) slot++;
@@ -1463,8 +1494,202 @@ void ecache_init(const llama_model & model) {
 }
 
 // between generated tokens (nothing is computing): swap cold cached experts for hot uncached ones
+// ---- asynchronous adaptation (LLAMA_EXPERT_CACHE_ASYNC, default on) --------------------------------------------
+// Prediction: the experts a (layer, group) will use next are scored by a linear model on log-uses in the last 16,
+// 64, 256 and 1024 tokens plus the profile prior (weights fitted offline on Wren_T3-v2 traces:
+// LLAMA_EXPERT_CACHE_W). Every LLAMA_EXPERT_CACHE_EVERY tokens each group keeps its cap best-scored experts.
+// Swaps do not stall generation: the outgoing expert leaves the map at once (the CPU computes it), a worker thread
+// reads the incoming one into pinned staging memory and copies it on a second GPU stream, and it enters the map at
+// the next adaptation, once the copy is done. Either way every expert is computed exactly, so results never change.
+
+static const int ec_win[4] = {16, 64, 256, 1024};
+
+struct ecache_job { ecache_group * g; int slot, e; uint8_t * stage; };
+struct ecache_worker {
+    std::mutex mu; std::condition_variable cv, idle_cv;
+    std::deque<ecache_job> q; int busy = 0;
+    std::thread th; bool started = false;
+    ggml_backend_t cbe = nullptr;                 // second backend instance on the GPU: its own stream
+    ggml_backend_buffer_t stage_buf = nullptr; uint8_t * stage = nullptr; size_t slot_bytes = 0; int slots = 0;
+};
+static ecache_worker & g_ecw = *new ecache_worker();   // never destroyed: the detached worker may still wait on it at exit
+
+bool ecache_read(const ggml_tensor * t, int e, uint8_t * dst);
+
+static void ecache_worker_loop() {
+    for (;;) {
+        ecache_job j;
+        {
+            std::unique_lock<std::mutex> lk(g_ecw.mu);
+            g_ecw.cv.wait(lk, [] { return !g_ecw.q.empty(); });
+            j = g_ecw.q.front(); g_ecw.q.pop_front();
+        }
+        size_t off = 0;
+        bool ok = true;
+        for (int r = 0; r < 3 && ok; r++) {
+            const size_t nb = ecache_expert_bytes(j.g->base[r]);
+            ok = ecache_read(j.g->base[r], j.e, j.stage + off);
+            if (ok) ggml_backend_tensor_set_async(g_ecw.cbe, j.g->cache[r], j.stage + off, (size_t) j.slot * j.g->cache[r]->nb[2], nb);
+            off += nb;
+        }
+        if (!ok) j.g->pending_in[j.slot] = -2;     // read failed: the slot stays empty
+        {
+            std::lock_guard<std::mutex> lk(g_ecw.mu);
+            if (--g_ecw.busy == 0) g_ecw.idle_cv.notify_all();
+        }
+    }
+}
+
+static bool ecache_async_init() {
+    if (g_ecw.started) return true;
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    g_ecw.cbe = gpu ? ggml_backend_dev_init(gpu, nullptr) : nullptr;
+    if (!g_ecw.cbe) return false;
+    size_t mx = 0;
+    for (auto & lg : g_ec.L) for (auto & g : lg) if (g.cap > 0) {
+        mx = std::max(mx, ecache_expert_bytes(g.base[0]) + ecache_expert_bytes(g.base[1]) + ecache_expert_bytes(g.base[2]));
+    }
+    g_ecw.slot_bytes = mx;
+    g_ecw.slots = g_ec.max_swaps;
+    ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(gpu);    // pinned: truly asynchronous copies
+    g_ecw.stage_buf = hb ? ggml_backend_buft_alloc_buffer(hb, mx * g_ecw.slots) : nullptr;
+    if (!g_ecw.stage_buf) return false;
+    g_ecw.stage = (uint8_t *) ggml_backend_buffer_get_base(g_ecw.stage_buf);
+    g_ecw.th = std::thread(ecache_worker_loop);
+    g_ecw.th.detach();
+    g_ecw.started = true;
+    return true;
+}
+
+static void ecache_wait_worker() {
+    std::unique_lock<std::mutex> lk(g_ecw.mu);
+    g_ecw.idle_cv.wait(lk, [] { return g_ecw.busy == 0; });
+}
+
+void ecache_quiesce() {
+    if (!g_ecw.started) return;
+    ecache_wait_worker();
+    ggml_backend_synchronize(g_ecw.cbe);
+}
+
+// every token: window counts from the hook's events
+static void ecache_push_token() {
+    const int RS = 1025;
+    if ((int) g_ec.ring.size() != RS) g_ec.ring.assign(RS, {});
+    const int64_t t = g_ec.ring_tok++;
+    auto & slotv = g_ec.ring[t % RS];
+    slotv.swap(g_ec.cur_ev);
+    g_ec.cur_ev.clear();
+    auto apply = [&](const std::vector<int32_t> & ev, int wi, float d) {
+        for (int32_t x : ev) {
+            const int gid = x >> 16, e = x & 0xffff;
+            ecache_group & g = g_ec.L[gid >> 1][gid & 1];
+            if (e < (int) g.cnt[wi].size()) g.cnt[wi][e] += d;
+        }
+    };
+    for (int wi = 0; wi < 4; wi++) {
+        apply(slotv, wi, 1.0f);
+        if (t - ec_win[wi] >= 0) apply(g_ec.ring[(t - ec_win[wi]) % RS], wi, -1.0f);
+    }
+}
+
+static void ecache_adapt_async() {
+    static float w[5] = {0.28f, 0.191f, 0.127f, 0.021f, 0.006f};
+    static float hyst = 0.05f;
+    static bool once = false;
+    if (!once) {
+        once = true;
+        if (const char * e = getenv("LLAMA_EXPERT_CACHE_W")) sscanf(e, "%f,%f,%f,%f,%f", &w[0], &w[1], &w[2], &w[3], &w[4]);
+        if (const char * e = getenv("LLAMA_EXPERT_CACHE_HYST")) hyst = (float) atof(e);
+    }
+    // a) the previous batch of copies: wait for it (normally long done) and put its experts in the maps
+    ecache_wait_worker();
+    ggml_backend_synchronize(g_ecw.cbe);
+    std::vector<ecache_group *> dirty;
+    for (auto & lg : g_ec.L) for (auto & g : lg) {
+        bool d = false;
+        for (int s = 0; s < g.cap; s++) {
+            const int e = g.pending_in[s];
+            if (e == -1) continue;
+            g.pending_in[s] = -1;
+            if (e < 0) continue;                              // failed read
+            g.slot_of[e] = s; g.expert_in[s] = e; g.mapv[g.lo + e] = (float) s; d = true;
+            g_ec.swaps_total++;
+        }
+        if (d) dirty.push_back(&g);
+    }
+    // b) new plan: per group, the cap best-scored experts; swaps ranked by score gain, at most max_swaps
+    struct sw { float gain; ecache_group * g; int slot, e; };
+    std::vector<sw> sws;
+    std::vector<float> sc;
+    for (auto & lg : g_ec.L) for (auto & g : lg) {
+        if (g.cap == 0) continue;
+        sc.resize(g.n);
+        for (int e = 0; e < g.n; e++) {
+            sc[e] = w[4]*g.prior[e];
+            for (int wi = 0; wi < 4; wi++) sc[e] += w[wi]*log1pf(std::max(0.0f, g.cnt[wi][e]));
+        }
+        std::vector<int> in, out;   // candidates to load (not cached), cached slots ordered from worst
+        for (int e = 0; e < g.n; e++) if (g.slot_of[e] < 0) in.push_back(e);
+        std::vector<int> slots;
+        for (int s = 0; s < g.cap; s++) slots.push_back(s);
+        auto slot_score = [&](int s) { return g.expert_in[s] >= 0 ? sc[g.expert_in[s]] : -1e30f; };
+        std::sort(in.begin(), in.end(), [&](int a, int b) { return sc[a] > sc[b]; });
+        std::sort(slots.begin(), slots.end(), [&](int a, int b) { return slot_score(a) < slot_score(b); });
+        for (size_t i = 0; i < in.size() && i < slots.size(); i++) {
+            const float gain = sc[in[i]] - slot_score(slots[i]);
+            if (gain <= hyst) break;
+            sws.push_back({gain, &g, slots[i], in[i]});
+        }
+    }
+    std::sort(sws.begin(), sws.end(), [](const sw & a, const sw & b) { return a.gain > b.gain; });
+    if ((int) sws.size() > g_ecw.slots) sws.resize(g_ecw.slots);
+    std::vector<ecache_job> jobs;
+    for (size_t i = 0; i < sws.size(); i++) {
+        ecache_group & g = *sws[i].g;
+        const int s = sws[i].slot, old = g.expert_in[s];
+        if (old >= 0) { g.slot_of[old] = -1; g.mapv[g.lo + old] = (float) g.cap; }   // the CPU takes it back now
+        g.expert_in[s] = -1;
+        g.pending_in[s] = sws[i].e;
+        jobs.push_back({&g, s, sws[i].e, g_ecw.stage + i*g_ecw.slot_bytes});
+        if (dirty.empty() || dirty.back() != &g) dirty.push_back(&g);
+    }
+    // c) maps for the next token (evictions and arrivals), then the copies in the background
+    std::sort(dirty.begin(), dirty.end()); dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
+    for (ecache_group * g : dirty) ggml_backend_tensor_set_async(g_ecw.cbe, g->map, g->mapv.data(), 0, g->mapv.size() * sizeof(float));
+    ggml_backend_synchronize(g_ecw.cbe);
+    if (!jobs.empty()) {
+        std::lock_guard<std::mutex> lk(g_ecw.mu);
+        for (auto & j : jobs) g_ecw.q.push_back(j);
+        g_ecw.busy += (int) jobs.size();
+        g_ecw.cv.notify_all();
+    }
+    if (getenv("LLAMA_EXPERT_CACHE_LOG") && g_ec.tokens % (g_ec.every * 32) == 0) {
+        fprintf(stderr, "%s: %lld tokens, hit rate %.1f%%, %lld swaps so far\n", __func__, (long long) g_ec.tokens,
+                       g_ec.uses ? 100.0 * g_ec.hits / g_ec.uses : 0.0, (long long) g_ec.swaps_total);
+        g_ec.uses = g_ec.hits = 0;
+    }
+}
+
+static bool ecache_async_on() {
+    static const bool on = (!getenv("LLAMA_EXPERT_CACHE_ASYNC") || atoi(getenv("LLAMA_EXPERT_CACHE_ASYNC")) != 0) && ecache_async_init();
+    return on;
+}
+
+void ecache_adapt_sync();
+
 void ecache_adapt() {
     if (!g_ec.on) return;
+    if (ecache_async_on()) {
+        ecache_push_token();
+        if (++g_ec.tokens % g_ec.every) return;
+        ecache_adapt_async();
+        return;
+    }
+    ecache_adapt_sync();
+}
+
+void ecache_adapt_sync() {
     if (++g_ec.tokens % g_ec.every) return;
     struct sw { float gain; int il, gi, hot, slot; };
     std::vector<sw> sws;
@@ -1508,7 +1733,7 @@ class llm_graph_input_ecache : public llm_graph_input_i {
 public:
     void set_input(const llama_ubatch * ubatch) override {
         g_ec.active = small && !getenv("LLAMA_EC_NOSKIP");
-        static int dbg = getenv("LLAMA_EC_DBG") ? 0 : 1000; if (dbg < 3) { dbg++; fprintf(stderr, "[ec-input] n_tokens %d small %d\n", (int) ubatch->n_tokens, (int) small); }                    // the CPU skips cached experts only when this graph computes them on the GPU
+        static int dbg = getenv("LLAMA_EC_DBG") ? 0 : 1000000; if (dbg < (getenv("LLAMA_EC_DBG") ? atoi(getenv("LLAMA_EC_DBG")) : 0)) { dbg++; fprintf(stderr, "[ec-input] n_tokens %d small %d\n", (int) ubatch->n_tokens, (int) small); }                    // the CPU skips cached experts only when this graph computes them on the GPU
         if (small && ubatch->n_tokens == 1) ecache_adapt();
     }
     bool can_reuse(const llm_graph_params & params) override { return (params.ubatch.n_tokens < 32) == small; }
@@ -1540,7 +1765,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
     ggml_tensor * sel_flat0 = lookup ? ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok) : nullptr;
     // bigger batches: llama.cpp streams all the experts to the GPU anyway. Exact mode: single tokens only (with more
     // tokens the CPU may take its tiled path for an expert with several rows, which the exact kernels do not mirror)
-    const bool use_cache = g_ec.on && (ecache_exact() ? n_tok == 1 : n_tok < 32);
+    // decided on the ubatch size, the same for every layer: the last layer keeps only the output rows (n_tok can be
+    // 1 there for a multi-token ubatch), while the CPU's skip switch (set_input) is per graph
+    const bool use_cache = g_ec.on && (ecache_exact() ? n_tokens == 1 : n_tokens < 32);
     if (g_ec.on && il == 0) {
         auto inp = std::make_unique<llm_graph_input_ecache>();
         inp->small = use_cache;

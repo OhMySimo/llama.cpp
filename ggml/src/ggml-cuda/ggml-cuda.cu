@@ -900,6 +900,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
+    if (const char * f = getenv("LLAMA_FILL_BUFFERS")) {   // (fork) debug: fill new device buffers with a byte value
+        CUDA_CHECK(cudaMemset(dev_ptr, atoi(f), size));
+    }
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
