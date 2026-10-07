@@ -1780,19 +1780,26 @@ void ggml_cuda_mul_mat_vec_q(
     // (fork) single-vector src1 shared by consecutive matmuls of the same graph (e.g. qkv, alpha, beta, z on hc_mixed):
     // its q8_1 quantization is kept in a persistent buffer and reused. Same input, same deterministic kernel, so the
     // result is identical; src1 is alive (not overwritten) between two of its consumers. Invalidated per graph_compute.
-    static const ggml_tensor * memo_t = nullptr;
-    static const void * memo_data = nullptr;
-    static uint64_t memo_epoch = 0;
-    static int64_t memo_ne10 = 0;
-    const bool memo = ggml_cuda_q8_memo_buf && ctx.curr_stream_no == 0 && ne11*ne12*ne13 == 1 && q8_1_size <= GGML_CUDA_Q8_MEMO_SIZE;
+    // two slots (e.g. hc_norm is used by hc_down and, after the q/k/v products on hc_mixed, by hc_inject)
+    struct q8_memo { const ggml_tensor * t; const void * data; uint64_t epoch; int64_t ne10; };
+    static q8_memo memo_s[2] = {};
+    static int memo_next = 0;
+    const bool memo = ggml_cuda_q8_memo_buf && ctx.curr_stream_no == 0 && ne11*ne12*ne13 == 1 && 2*q8_1_size <= GGML_CUDA_Q8_MEMO_SIZE;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q = nullptr;
     if (memo) {
-        src1_q = (char *) ggml_cuda_q8_memo_buf;
-        if (memo_t == src1 && memo_data == src1->data && memo_epoch == ggml_cuda_graph_epoch && memo_ne10 == ne10) {
+        int hit = -1;
+        for (int m = 0; m < 2; m++) {
+            const q8_memo & e = memo_s[m];
+            if (e.t == src1 && e.data == src1->data && e.epoch == ggml_cuda_graph_epoch && e.ne10 == ne10) hit = m;
+        }
+        if (hit >= 0) {
+            src1_q = (char *) ggml_cuda_q8_memo_buf + hit*(GGML_CUDA_Q8_MEMO_SIZE/2);
             goto quantized;
         }
-        memo_t = src1; memo_data = src1->data; memo_epoch = ggml_cuda_graph_epoch; memo_ne10 = ne10;
+        const int m = memo_next; memo_next ^= 1;
+        memo_s[m] = { src1, src1->data, ggml_cuda_graph_epoch, ne10 };
+        src1_q = (char *) ggml_cuda_q8_memo_buf + m*(GGML_CUDA_Q8_MEMO_SIZE/2);
     } else {
         src1_q = src1_q8_1.alloc(q8_1_size);
     }
