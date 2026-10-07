@@ -27,7 +27,7 @@ static std::vector<const ggml_tensor *> g_mk_check;   // LLAMA_MK_CHECK (debug)
 
 enum mk_op : int {
     MK_HC_POST, MK_RMS_BIG, MK_QUANT, MK_MATVEC, MK_SILU_UP, MK_HC_PRE,
-    MK_LIN_CONV, MK_ALPHA, MK_SIGMOID, MK_SSS, MK_RMS_SMALL, MK_GDN, MK_COPY,
+    MK_LIN_CONV, MK_ALPHA, MK_SIGMOID, MK_SSS, MK_RMS_SMALL, MK_GDN, MK_COPY, MK_COMBINE, MK_MATVEC_F32, MK_ROUTER,
 };
 
 struct mk_stage {
@@ -403,6 +403,104 @@ static __device__ void mk_gdn(const mk_stage & s) {
     }
 }
 
+// MoE combine: ADD (cached experts + CPU experts, a + b), moe_weighted_reduction_f32 (expert_scale null: x*1.0f), then
+// ADD of the shared expert. a: cached [n, k], b: CPU [n, k], c: weights [k], d: shared expert [n];
+// x: weighted sum (ffn_moe_out), y: + shared expert (ffn_out)
+static __device__ void mk_combine(const mk_stage & s) {
+    const float * ca = (const float *) s.a, * cb = (const float *) s.b, * w = (const float *) s.c, * sh = (const float *) s.d;
+    const int n = s.n0, k = s.n1;
+    const float one = s.f0;   // 1.0f, a runtime value as in the original kernel
+    for (int col = blockIdx.x*MK_NT + threadIdx.x; col < n; col += gridDim.x*MK_NT) {
+        float sum = ((ca ? ca[col] + cb[col] : cb[col]) * one) * w[0];
+        for (int e = 1; e < k; ++e) {
+            const float v = ca ? ca[e*n + col] + cb[e*n + col] : cb[e*n + col];
+            sum += (v * one) * w[e];
+        }
+        ((float *) s.x)[col] = sum;
+        ((float *) s.y)[col] = sum + sh[col];
+    }
+}
+
+// mul_mat_vec_f<float, float, 1, 256>: one workgroup per row, the original block code (ncols even)
+static __device__ void mk_matvec_f32(const mk_stage & s, float * buf_iw) {
+    const int tid = threadIdx.x, ncols2 = s.n1/2;
+    for (int row = blockIdx.x; row < s.n0; row += gridDim.x) {
+        const float2 * x2 = (const float2 *) ((const float *) s.a + (size_t) row*s.n1);
+        const float2 * y2 = (const float2 *) s.b;
+        if (tid < 32) buf_iw[tid] = 0.0f;
+        __syncthreads();
+        float sumf = 0.0f;
+        for (int col2 = tid; col2 < ncols2; col2 += 256) {
+            const float2 tmpx = x2[col2];
+            const float2 tmpy = y2[col2];
+            ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+        }
+        sumf = warp_reduce_sum<32>(sumf);
+        buf_iw[tid/32] = sumf;
+        __syncthreads();
+        if (tid < 32) {
+            sumf = buf_iw[tid];
+            sumf = warp_reduce_sum<32>(sumf);
+        }
+        __syncthreads();
+        if (tid == 0) ((float *) s.x)[row] = sumf;
+    }
+}
+
+// router of one token (workgroup 0): soft_max_f32<true, 256, 256> (scale f0, no mask), k_argsort_f32_i32<DESC> (bitonic,
+// 256 columns), the first n1 indices copied (CONT of the top-k view). a: logits; x: probs, y: sorted ids, b: top-k ids
+static __device__ void mk_router(const mk_stage & s, float * buf_iw, float * vals, int * dst_row) {
+    if (blockIdx.x != 0) return;
+    const int tid = threadIdx.x, ncols = 256;
+    const float * x = (const float *) s.a;
+    const float * mask = (const float *) s.c;   // nullptr
+    const float slope = 1.0f;
+    float max_val = -INFINITY;
+    {
+        const int col = tid;
+        const float val = x[col]*s.f0 + (mask ? slope*mask[col] : 0.0f);
+        vals[col] = val;
+        max_val = max(max_val, val);
+    }
+    max_val = block_reduce<block_reduce_method::MAX, 256>(max_val, buf_iw);
+    float tmp = 0.0f;
+    {
+        const int col = tid;
+        const float val = expf(vals[col] - max_val);
+        tmp += val;
+        vals[col] = val;
+    }
+    __syncthreads();
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, buf_iw);
+    const float inv_sum = 1.0f / tmp;
+    float * probs = (float *) s.x;
+    probs[tid] = vals[tid] * inv_sum;
+    __syncthreads();
+    // argsort (descending) of the probabilities just written
+    dst_row[tid] = tid;
+    __syncthreads();
+    for (int k = 2; k <= ncols; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            const int col = tid, ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (dst_row[col] >= ncols || (dst_row[ixj] < ncols && probs[dst_row[col]] < probs[dst_row[ixj]])) {
+                        const int t = dst_row[col]; dst_row[col] = dst_row[ixj]; dst_row[ixj] = t;
+                    }
+                } else {
+                    if (dst_row[ixj] >= ncols || (dst_row[col] < ncols && probs[dst_row[col]] > probs[dst_row[ixj]])) {
+                        const int t = dst_row[col]; dst_row[col] = dst_row[ixj]; dst_row[ixj] = t;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    ((int *) s.y)[tid] = dst_row[tid];
+    if (tid < s.n1) ((int *) s.b)[tid] = dst_row[tid];
+}
+
 static __device__ void mk_copy(const mk_stage & s) {   // n0 floats
     const float * a = (const float *) s.a;
     float * x = (float *) s.x;
@@ -415,6 +513,8 @@ __launch_bounds__(MK_NT, 1)
 static __global__ void layer_mk_kernel(const mk_prog p) {
     __shared__ float s_red[32];
     __shared__ block_q8_1 ys[MK_MAXQB];
+    __shared__ float s_vals[256];
+    __shared__ int   s_idx[256];
     if (p.ts && blockIdx.x == 0 && threadIdx.x == 0) p.ts[0] = wall_clock64();
     for (int k = 0; k < p.n; k++) {
         const mk_stage & s = p.s[k];
@@ -432,6 +532,9 @@ static __global__ void layer_mk_kernel(const mk_prog p) {
             case MK_RMS_SMALL: mk_rms_small(s, s_red); break;
             case MK_GDN:       mk_gdn(s);            break;
             case MK_COPY:      mk_copy(s);           break;
+            case MK_COMBINE:   mk_combine(s);        break;
+            case MK_MATVEC_F32: mk_matvec_f32(s, s_red); break;
+            case MK_ROUTER:    mk_router(s, s_red, s_vals, s_idx); break;
         }
         if (s.bar) {
             mk_grid_sync(p.bar);
@@ -566,6 +669,79 @@ bool mk_match_hc(mk_walker & w, const ggml_tensor * first, mk_builder & B, hc_ou
     { mk_stage & s = B.add(MK_HC_PRE); s.a = B.in(mul); s.b = B.in(up); s.n0 = (int) n_embd; s.n1 = (int) hc;
       s.f0 = ggml_get_op_params_f32(pre, 0); s.x = B.out(j_pre, pre, ggml_nbytes(pre)); }
     o.xn = mul; o.mixed = pre; o.xq = xq;
+    return true;
+}
+
+// MoE combine at node `first` (ADD cached + CPU, or MUL when no cache), then the reduction ADDs and the shared expert ADD
+bool mk_match_combine(mk_walker & w, const ggml_tensor * first, mk_builder & B) {
+    const ggml_tensor * add0 = nullptr, * mul = first;
+    int j_add0 = -1;
+    if (first->op == GGML_OP_ADD) {
+        add0 = first; j_add0 = w.j;
+        mul = w.next();
+    }
+    if (!mul || mul->op != GGML_OP_MUL || (add0 && mul->src[0] != add0)) return false;
+    const ggml_tensor * ex = mul->src[0], * wt = mul->src[1];
+    const int64_t n = ex->ne[0], k = ex->ne[1];
+    if (ex->type != GGML_TYPE_F32 || !ggml_is_contiguous(ex) || ex->ne[2] != 1 || ex->ne[3] != 1 || !mk_vec(wt, k) || k < 2 || k > 64) return false;
+    if (add0 && (!ggml_are_same_shape(add0->src[0], add0) || !ggml_are_same_shape(add0->src[1], add0) || !ggml_is_contiguous(add0->src[0]) ||
+                 !ggml_is_contiguous(add0->src[1]) || add0->src[0]->type != GGML_TYPE_F32 || add0->src[1]->type != GGML_TYPE_F32)) return false;
+    const ggml_tensor * prev = nullptr;
+    for (int64_t e = 1; e < k; e++) {
+        const ggml_tensor * a = w.next();
+        if (!a || a->op != GGML_OP_ADD || ggml_nelements(a) != n || !ggml_is_contiguous(a)) return false;
+        const ggml_tensor * v1 = a->src[1];
+        if (v1->view_src != mul || v1->view_offs != (size_t) (e*n*sizeof(float)) || ggml_nelements(v1) != n) return false;
+        if (e == 1) {
+            const ggml_tensor * v0 = a->src[0];
+            if (v0->view_src != mul || v0->view_offs != 0 || ggml_nelements(v0) != n) return false;
+        } else if (a->src[0] != prev) {
+            return false;
+        }
+        prev = a;
+    }
+    const int j_moe = w.j;
+    const ggml_tensor * fo = w.next();
+    if (!fo || fo->op != GGML_OP_ADD || fo->src[0] != prev || !mk_vec(fo->src[1], n) || !mk_vec(fo, n)) return false;
+    const int j_fo = w.j;
+    mk_stage & s = B.add(MK_COMBINE);
+    s.a = add0 ? B.in(add0->src[0]) : nullptr; s.b = add0 ? B.in(add0->src[1]) : B.in(ex); s.c = B.in(wt); s.d = B.in(fo->src[1]);
+    s.n0 = (int) n; s.n1 = (int) k; s.f0 = 1.0f;
+    s.x = B.out(j_moe, prev, n*sizeof(float));
+    s.y = B.out(j_fo, fo, n*sizeof(float));
+    (void) j_add0;
+    return true;
+}
+
+// router after an HC chain: f32 product, SOFT_MAX, ARGSORT (descending), CONT of the top-k view
+bool mk_match_router(mk_walker & w, const hc_out & hc, mk_builder & B) {
+    const ggml_tensor * mm = w.next();
+    if (!mm || mm->op != GGML_OP_MUL_MAT || mm->src[1] != hc.mixed || mm->src[0]->type != GGML_TYPE_F32) return false;
+    const int j_mm = w.j;
+    const ggml_tensor * W = mm->src[0];
+    const int64_t K = W->ne[0], R = W->ne[1];
+    // mul_mat_vec_f picks 256 threads when K/(2*256) iterations is the smallest count (K > 7*64 for this formula)
+    int64_t best_bs = 32, best_it = (K + 63)/64;
+    for (int64_t bs = 64; bs <= 256; bs += 32) { const int64_t it = (K + 2*bs - 1)/(2*bs); if (it < best_it) { best_it = it; best_bs = bs; } }
+    if (best_bs != 256 || R != 256 || !ggml_is_contiguous(W) || K % 2 != 0 || W->ne[2] != 1 || !mk_vec(mm, R) ||
+        ggml_backend_buffer_get_usage(W->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) return false;
+    const ggml_tensor * sm = w.next();
+    if (!sm || sm->op != GGML_OP_SOFT_MAX || sm->src[0] != mm || sm->src[1] || sm->src[2] || !mk_vec(sm, R)) return false;
+    float smp[2]; memcpy(smp, sm->op_params, sizeof(smp));   // scale, max_bias
+    if (smp[1] != 0.0f) return false;
+    const int j_sm = w.j;
+    const ggml_tensor * as = w.next();
+    if (!as || as->op != GGML_OP_ARGSORT || !mk_is(as->src[0], sm) || ggml_get_op_params_i32(as, 0) != GGML_SORT_ORDER_DESC ||
+        as->type != GGML_TYPE_I32 || ggml_nelements(as) != R) return false;
+    const int j_as = w.j;
+    const ggml_tensor * ct = w.next();
+    if (!ct || ct->op != GGML_OP_CONT || ct->src[0]->view_src != as || ct->src[0]->view_offs != 0 || ct->type != GGML_TYPE_I32 ||
+        ggml_nelements(ct) > 64 || !ggml_is_contiguous(ct)) return false;
+    const int j_ct = w.j;
+    { mk_stage & s = B.add(MK_MATVEC_F32); s.a = W->data; s.b = B.in(mm->src[1]); s.n0 = (int) R; s.n1 = (int) K;
+      s.x = B.out(j_mm, mm, R*sizeof(float)); }
+    { mk_stage & s = B.add(MK_ROUTER); s.a = B.in(mm); s.c = nullptr; s.f0 = smp[0]; s.n1 = (int) ggml_nelements(ct);
+      s.x = B.out(j_sm, sm, R*sizeof(float)); s.y = B.out(j_as, as, R*sizeof(int)); s.b = B.out(j_ct, ct, ggml_nelements(ct)*sizeof(int)); }
     return true;
 }
 
@@ -715,7 +891,7 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
         getenv("LLAMA_MMVQ_MULTIROW_R") || getenv("LLAMA_MMVQ_MULTIROW_MAXITER") || getenv("LLAMA_NO_SSM_FUSE");
     static const int level = getenv("LLAMA_LAYER_MK") ? atoi(getenv("LLAMA_LAYER_MK")) : 2;   // 1: HC chains only
     const ggml_tensor * n0 = g->nodes[i];
-    if (off || (n0->op != GGML_OP_DSV4_HC_POST && n0->op != GGML_OP_RMS_NORM) ||
+    if (off || (n0->op != GGML_OP_DSV4_HC_POST && n0->op != GGML_OP_RMS_NORM && n0->op != GGML_OP_ADD && n0->op != GGML_OP_MUL) ||
         ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32 || ctx.curr_stream_no != 0) {
         return 0;
     }
@@ -736,7 +912,13 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
     mk_builder B;
     B.scratch = scratch;
     mk_walker w{g, i - 1};
+    static const bool comb_on = !getenv("LLAMA_MK_NO_COMBINE"), router_on = !getenv("LLAMA_MK_NO_ROUTER");
     const ggml_tensor * first = w.next();
+    if (first && (first->op == GGML_OP_ADD || first->op == GGML_OP_MUL)) {
+        if (!comb_on || !mk_match_combine(w, first, B)) return 0;
+        first = w.next();
+        if (!first || first->op != GGML_OP_DSV4_HC_POST) return 0;
+    }
     hc_out hc;
     if (!first || !mk_match_hc(w, first, B, hc)) {
         return 0;
@@ -746,6 +928,7 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
     for (int k = i; k <= last; k++) {
         if (g->nodes[k]->op == GGML_OP_RMS_NORM && !ggml_node_has_n_uses(g, k, 1)) return 0;
     }
+    hc_out hc_last = hc;
     if (level >= 2) {
         mk_builder B2 = B;
         mk_walker w2 = w;
@@ -761,11 +944,16 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
             mk_builder B3 = B2;
             mk_walker w3 = w2;
             if (nx && mk_match_hc(w3, nx, B3, hc2) && B3.st.size() <= MK_MAXST) {
-                B = B3; last = w3.j;
+                B = B3; last = w3.j; hc_last = hc2;
             } else if (B2.st.size() <= MK_MAXST) {
                 B = B2; last = w2.j;
             }
         }
+    }
+    if (router_on) {   // the router (logits, softmax, top-k ids) after the last HC chain
+        mk_builder B4 = B;
+        mk_walker w4{g, last};
+        if (mk_match_router(w4, hc_last, B4)) { B = B4; last = w4.j; }
     }
     // write back, original node order; a copy overlapping an earlier one goes to a later barrier group
     {
@@ -794,7 +982,7 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
     {
         static const bool dbg = getenv("LLAMA_MK_DBG") != nullptr;
         static int left = 6;
-        if (dbg && left > 0 && B.st.size() > 15) { left--; fprintf(stderr, "[layer-mk] epoch %llu node %d:", (unsigned long long) ggml_cuda_graph_epoch, i); fprintf(stderr, " node %d: %zu stages (%zu write-backs), nodes %d..%d, scratch %zu\n", i, B.st.size(), B.wb.size(), i, last, B.used); }
+        if (dbg && left > 0 && B.st.size() > 15 && ggml_cuda_graph_epoch > 190) { left--; fprintf(stderr, "[layer-mk] epoch %llu node %d:", (unsigned long long) ggml_cuda_graph_epoch, i); fprintf(stderr, " node %d: %zu stages (%zu write-backs), nodes %d..%d, scratch %zu\n", i, B.st.size(), B.wb.size(), i, last, B.used); }
     }
     if (B.st.size() > MK_MAXST || B.used > (1u << 20)) return 0;
 
