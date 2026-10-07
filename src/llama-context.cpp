@@ -1402,6 +1402,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // LLAMA_UBATCH_PROF=1 (fork): host time per phase of a ubatch (graph reuse/build, inputs, compute)
+    static const bool uprof = getenv("LLAMA_UBATCH_PROF") != nullptr;
+    const int64_t up_t0 = uprof ? ggml_time_us() : 0;
+    bool up_reused = false;
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1420,6 +1424,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        up_reused = true;
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1448,6 +1453,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    const int64_t up_t1 = uprof ? ggml_time_us() : 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1458,7 +1464,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t up_t2 = uprof ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (uprof && ubatch.n_tokens == 1) {
+        static int64_t a = 0, b = 0, c = 0, n = 0, nr = 0;
+        a += up_t1 - up_t0; b += up_t2 - up_t1; c += ggml_time_us() - up_t2; n++; nr += up_reused;
+        if (n % 64 == 0) { fprintf(stderr, "[ubatch-prof] reused %lld/64, graph %.2f ms, set_inputs %.2f ms, compute %.2f ms\n", (long long) nr, a / 64e3, b / 64e3, c / 64e3); a = b = c = nr = 0; }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

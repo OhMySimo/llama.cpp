@@ -1902,8 +1902,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    static double tw = 0; static long nw = 0; const double t0w = tl ? sched_now_ms() : 0;
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                    if (tl) { tw += sched_now_ms() - t0w; if (++nw % 6400 == 0) { fprintf(stderr, "[evwait] %.1f us per event_wait\n", tw / 6400 * 1e3); tw = 0; } }
+                } else if (!(batch_cpy && ggml_backend_buffer_is_host(input->buffer) && !ggml_backend_buffer_is_host(input_cpy->buffer) &&
+                             split_backend->iface.set_tensor_async && ggml_is_contiguous(input) &&
+                             ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                             !(split->graph.n_nodes > 0 && split->graph.nodes[0]->op == GGML_OP_MUL_MAT_ID))) {
+                    // (fork) not for the queued host -> device copy below: it runs on the split backend's own stream,
+                    // after everything already queued there, so the host need not wait for the GPU here
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -2011,7 +2018,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                         // fork: host -> device, queued on the consumer's stream (ordered before its compute); the host data
                         // must not change until the copy has run: synchronized before the next CPU split computes
+                        { static double th = 0; static long nh = 0; const double t0h = tl ? sched_now_ms() : 0;
                         ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        if (tl) { th += sched_now_ms() - t0h; if (++nh % 6400 == 0) { fprintf(stderr, "[h2d] %.1f us per set_async (host %s)\n", th / 6400 * 1e3, ggml_backend_buffer_name(input->buffer)); th = 0; } } }
                         h2d_backend = split_backend;
                     } else {
                         ggml_backend_synchronize(input_backend);
@@ -2027,6 +2036,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        {   // LLAMA_SPLIT_INPUTS_DBG=1 (fork): list each split's inputs once
+            static int dbg_in = getenv("LLAMA_SPLIT_INPUTS_DBG") ? 1 : 0; static int printed = 0;
+            if (dbg_in && printed < 12 && sched->n_splits > 20 && split_id >= 8 && split_id < 20) {
+                printed++;
+                fprintf(stderr, "[split-in] %d %s:", split_id, ggml_backend_name(split_backend));
+                for (int q = 0; q < split->n_inputs; q++) fprintf(stderr, " %s(%s,%zu B)", split->inputs[q]->name, ggml_backend_name(ggml_backend_sched_get_tensor_backend(sched, split->inputs[q])), ggml_nbytes(split->inputs[q]));
+                fprintf(stderr, "\n");
+            }
+        }
         const double tl_loop = tl ? sched_now_ms() : 0;
         if (d2h_backend) {
             static double t_wait = 0; static long n_wait = 0; const double tw0 = tl ? sched_now_ms() : 0;

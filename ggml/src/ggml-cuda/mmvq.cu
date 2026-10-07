@@ -1072,6 +1072,142 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+// (fork) q8_0 matrix x vector for few rows and long K (RDNA2: one wave per row leaves the GPU almost empty, e.g. the
+// 10240x4 and 10240x320 hyper-connection projections). The K loop of each lane is spread over NW waves: every wave
+// computes the per-block factors (d_x*d_y and the integer dot) of a subset of the lane's iterations, then wave 0 adds
+// them up in the original order with the original operation (MODE 0: fma into the running sum, as the contracted
+// `tmp += d*d*sumi` of mul_mat_vec_q; MODE 1: separate multiply and add), and the same warp reduction follows.
+// Identical results to mul_mat_vec_q<q8_0, 1> (nwarps 1, rows_per_block 1) when MODE matches the compiled original.
+#define MMVQ_KSPLIT_MAX_ITER 64
+template <int NW, int MODE>
+__launch_bounds__(NW*32, 1)
+static __global__ void mul_mat_vec_q8_0_ksplit(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+                                               const int blocks_per_row_x, const int stride_row_x) {
+    constexpr int qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ, bpi = vdr*32/qi;
+    __shared__ float sa[MMVQ_KSPLIT_MAX_ITER][32];
+    __shared__ float ss[MMVQ_KSPLIT_MAX_ITER][32];
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int kbx0 = lane / (qi/vdr);
+    const int kqs  = vdr * (lane % (qi/vdr));
+    const block_q8_0 * x = (const block_q8_0 *) vx + (size_t) row*stride_row_x;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    for (int i = threadIdx.y; kbx0 + i*bpi < blocks_per_row_x; i += NW) {
+        const int kbx = kbx0 + i*bpi;
+        int sumi = 0;
+#pragma unroll
+        for (int v = 0; v < vdr; ++v) {
+            sumi = ggml_cuda_dp4a(get_int_b2(x[kbx].qs, kqs + v), get_int_b4(y[kbx].qs, kqs + v), sumi);
+        }
+        const float d8_0 = x[kbx].d;
+        const float d8_1 = __low2half(y[kbx].ds);
+        sa[i][lane] = d8_0*d8_1;
+        ss[i][lane] = (float) sumi;
+    }
+    __syncthreads();
+    if (threadIdx.y != 0) {
+        return;
+    }
+    float tmp = 0.0f;
+    if (MODE == 2) {   // test only: reversed order, must NOT match
+        int n = 0; while (kbx0 + n*bpi < blocks_per_row_x) n++;
+        for (int i = n - 1; i >= 0; --i) tmp = __fmaf_rn(sa[i][lane], ss[i][lane], tmp);
+    } else
+    for (int i = 0; kbx0 + i*bpi < blocks_per_row_x; ++i) {
+        tmp = MODE == 0 ? __fmaf_rn(sa[i][lane], ss[i][lane], tmp) : __fadd_rn(tmp, __fmul_rn(sa[i][lane], ss[i][lane]));
+    }
+    tmp = warp_reduce_sum<32>(tmp);
+    if (lane == 0) {
+        dst[row] = tmp;
+    }
+}
+
+
+// (fork) q8_0 matrix x vector for short K and many rows (e.g. 320x10240): one wave per row finishes after one or two
+// loop trips, so the launch of tens of thousands of waves dominates. Here each wave computes R consecutive rows; the
+// loop of each lane and the warp reduction of each row are those of mul_mat_vec_q<q8_0, 1> (fma accumulation, as
+// verified for the k-split kernel), so the results are identical.
+template <int R>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_vec_q8_0_multirow(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+                                                 const int blocks_per_row_x, const int stride_row_x, const int nrows_x) {
+    constexpr int qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ, bpi = vdr*32/qi;
+    const int lane = threadIdx.x;
+    const int row0 = (blockIdx.x*blockDim.y + threadIdx.y)*R;
+    if (row0 >= nrows_x) {
+        return;
+    }
+    const int kqs = vdr * (lane % (qi/vdr));
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float tmp[R] = {0.0f};
+    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += bpi) {
+        const float d8_1 = __low2half(y[kbx].ds);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const block_q8_0 * x = (const block_q8_0 *) vx + (size_t) (row0 + r)*stride_row_x + kbx;
+            int sumi = 0;
+#pragma unroll
+            for (int v = 0; v < vdr; ++v) {
+                sumi = ggml_cuda_dp4a(get_int_b2(x->qs, kqs + v), get_int_b4(y[kbx].qs, kqs + v), sumi);
+            }
+            const float d8_0 = x->d;
+            tmp[r] = __fmaf_rn(d8_0*d8_1, (float) sumi, tmp[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        tmp[r] = warp_reduce_sum<32>(tmp[r]);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            dst[row0 + r] = tmp[r];
+        }
+    }
+}
+
+// returns true if it handled the product (env LLAMA_MMVQ_KSPLIT: unset/1 = on, 0 = off, 2 = verify against the original)
+static bool mul_mat_vec_q8_0_ksplit_try(const void * vx, const void * vy, float * dst, int ncols_x, int nrows_x, int stride_row_x,
+                                        int warp_size, mmvq_parameter_table_id table_id, cudaStream_t stream, bool * verify) {
+    static const int mode_env = [] { const char * e = getenv("LLAMA_MMVQ_KSPLIT"); return e ? atoi(e) : 1; }();
+    static const int op_mode  = [] { const char * e = getenv("LLAMA_MMVQ_KSPLIT_OP"); return e ? atoi(e) : 0; }();
+    static const int nw       = [] { const char * e = getenv("LLAMA_MMVQ_KSPLIT_NW"); return e ? atoi(e) : 8; }();
+    static const int max_rows = [] { const char * e = getenv("LLAMA_MMVQ_KSPLIT_MAXROWS"); return e ? atoi(e) : 1024; }();
+    static const int min_iter = [] { const char * e = getenv("LLAMA_MMVQ_KSPLIT_MINITER"); return e ? atoi(e) : 8; }();
+    *verify = mode_env == 2;
+    const int blocks_per_row_x = ncols_x / QK8_0;
+    const int niter = (blocks_per_row_x + 7) / 8;
+    static const int mr_iter  = [] { const char * e = getenv("LLAMA_MMVQ_MULTIROW_MAXITER"); return e ? atoi(e) : 3; }();
+    static const int mr_rows  = [] { const char * e = getenv("LLAMA_MMVQ_MULTIROW_R"); return e ? atoi(e) : 4; }();
+    if (mode_env == 0 || warp_size != 32 || table_id != MMVQ_PARAMETERS_RDNA2) {
+        return false;
+    }
+    if (niter <= mr_iter && nrows_x > max_rows && nrows_x % (4*mr_rows) == 0) {
+        const dim3 block(32, 4);
+        const int nblocks = nrows_x / (4*mr_rows);
+        switch (mr_rows) {
+            case 2:  mul_mat_vec_q8_0_multirow<2><<<nblocks, block, 0, stream>>>(vx, vy, dst, blocks_per_row_x, stride_row_x, nrows_x); break;
+            case 8:  mul_mat_vec_q8_0_multirow<8><<<nblocks, block, 0, stream>>>(vx, vy, dst, blocks_per_row_x, stride_row_x, nrows_x); break;
+            default: mul_mat_vec_q8_0_multirow<4><<<nblocks, block, 0, stream>>>(vx, vy, dst, blocks_per_row_x, stride_row_x, nrows_x); break;
+        }
+        return true;
+    }
+    if (nrows_x > max_rows || niter < min_iter || niter > MMVQ_KSPLIT_MAX_ITER) {
+        return false;
+    }
+#define KSPLIT_LAUNCH(NW_) do { const dim3 block(32, NW_); \
+        if (op_mode == 2) mul_mat_vec_q8_0_ksplit<NW_, 2><<<nrows_x, block, 0, stream>>>(vx, vy, dst, blocks_per_row_x, stride_row_x); \
+        else              mul_mat_vec_q8_0_ksplit<NW_, 0><<<nrows_x, block, 0, stream>>>(vx, vy, dst, blocks_per_row_x, stride_row_x); } while (0)
+    switch (nw) {
+        case 2:  KSPLIT_LAUNCH(2);  break;
+        case 4:  KSPLIT_LAUNCH(4);  break;
+        case 16: KSPLIT_LAUNCH(16); break;
+        default: KSPLIT_LAUNCH(8);  break;
+    }
+#undef KSPLIT_LAUNCH
+    return true;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1095,6 +1231,39 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
+
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        static thread_local bool in_verify = false;
+        if (!in_verify && ncols_dst == 1 && !has_ids && fusion.gate == nullptr && fusion.x_bias == nullptr && nchannels_dst == 1 && nsamples_dst == 1) {
+            bool verify = false;
+            static float * vbuf = nullptr; static int vbuf_n = 0;
+            float * kdst = dst;
+            if ([&] { const char * e = getenv("LLAMA_MMVQ_KSPLIT"); return e && atoi(e) == 2; }()) {
+                if (vbuf_n < nrows_x) { if (vbuf) CUDA_CHECK(cudaFree(vbuf)); CUDA_CHECK(cudaMalloc(&vbuf, nrows_x*sizeof(float))); vbuf_n = nrows_x; }
+                kdst = vbuf;
+            }
+            if (mul_mat_vec_q8_0_ksplit_try(vx, vy, kdst, ncols_x, nrows_x, stride_row_x, warp_size, table_id, stream, &verify)) {
+                if (!verify) {
+                    return;
+                }
+                // verify: run the original too and compare bit by bit
+                in_verify = true;
+                mul_mat_vec_q_switch_ncols_dst<type>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                    nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                in_verify = false;
+                std::vector<float> a(nrows_x), b(nrows_x);
+                CUDA_CHECK(cudaMemcpyAsync(a.data(), dst, nrows_x*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(b.data(), vbuf, nrows_x*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                static long calls = 0, bad_calls = 0, bad_vals = 0;
+                long bad = 0; for (int r = 0; r < nrows_x; r++) bad += memcmp(&a[r], &b[r], 4) != 0;
+                calls++; bad_calls += bad > 0; bad_vals += bad;
+                if (calls % 500 == 0) fprintf(stderr, "[ksplit-verify] %ld calls, %ld with mismatches, %ld values differ (last %dx%d)\n", calls, bad_calls, bad_vals, ncols_x, nrows_x);
+                return;
+            }
+        }
+    }
 
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;

@@ -4415,6 +4415,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     CUDA_CHECK(cudaEventRecord(kp_ev[kp_n].first, cuda_ctx->stream()));
                     std::string key = ggml_op_desc(node);
+                    static const bool kp_names = getenv("LLAMA_KERNEL_PROF") && atoi(getenv("LLAMA_KERNEL_PROF")) == 2;
+                    if (kp_names) { std::string nm = node->name; size_t d = nm.find('-'); key += " " + (d == std::string::npos ? nm : nm.substr(0, d)) + " [" + std::to_string(ggml_nelements(node)) + "]"; }
                     if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) key += std::string(" ") + ggml_type_name(node->src[0]->type) + " " + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1]);
                     kp_key[kp_n] = key;
                 }

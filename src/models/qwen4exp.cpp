@@ -1533,8 +1533,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
         return build_lora_mm_id(down, ggml_swiglu_split(ctx0, g, u), ids, nullptr);  // [n_embd, k, n_tok]
     };
     const bool lc = use_cache && il < (int) g_ec.L.size() && g_ec.L[il][0].base[0];
-    ggml_tensor * e1 = tier(L.ffn_gate_exps,    L.ffn_up_exps,    L.ffn_down_exps,    0.0f,        n1);
-    ggml_tensor * e2 = tier(L.ffn_gate_exps_t2, L.ffn_up_exps_t2, L.ffn_down_exps_t2, (float) n1, n2);
+    ggml_tensor * e1;
+    ggml_tensor * e2;
+    if (lookup && !getenv("LLAMA_TIER_IDS_LATE")) {
+        // both groups' expert ids (GPU lookups) before any expert product (CPU): one CPU split per layer instead of
+        // two, i.e. one GPU<->CPU round trip less per layer. Same operations, only the graph order changes.
+        ggml_tensor * ids1 = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, g_tm.m[il][0], sel_flat0), k, n_tok), GGML_TYPE_I32);
+        ggml_tensor * ids2 = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, g_tm.m[il][1], sel_flat0), k, n_tok), GGML_TYPE_I32);
+        ggml_build_forward_expand(gf, ids1);
+        ggml_build_forward_expand(gf, ids2);
+        e1 = prod(L.ffn_gate_exps,    L.ffn_up_exps,    L.ffn_down_exps,    ids1);
+        e2 = prod(L.ffn_gate_exps_t2, L.ffn_up_exps_t2, L.ffn_down_exps_t2, ids2);
+    } else {
+        e1 = tier(L.ffn_gate_exps,    L.ffn_up_exps,    L.ffn_down_exps,    0.0f,        n1);
+        e2 = tier(L.ffn_gate_exps_t2, L.ffn_up_exps_t2, L.ffn_down_exps_t2, (float) n1, n2);
+    }
     // graph order: both groups' expert products first, so the caller can place the shared expert right after them
     // (the scheduler then runs it on the GPU while the CPU computes these products: LLAMA_SCHED_OVERLAP)
     ggml_build_forward_expand(gf, e1);
