@@ -16,34 +16,42 @@ struct pf_args {
     unsigned int seq;
     const volatile unsigned int * stop;
     int * sink;
+    unsigned long long * count;   // LLAMA_GPU_PREFETCH_LOG: chunks read (pinned host counter), else null
 };
+
+#define PF_U 16   // 16-byte loads per thread per chunk: 64 KB per workgroup and chunk
 
 static __global__ void __launch_bounds__(PF_NT) pf_kernel(const pf_args a) {
     __shared__ int quit;
     const unsigned long long total = a.end[a.n - 1];
-    const unsigned long long chunk = PF_NT * 16 * 4;
+    const unsigned long long chunk = PF_NT * 16 * PF_U;
     int4 acc = make_int4(0, 0, 0, 0);
     int r = 0;
+    unsigned long long done = 0;
+    if (threadIdx.x == 0) quit = 0;
+    __syncthreads();
     for (unsigned long long off = (unsigned long long) blockIdx.x * chunk; off < total; off += (unsigned long long) gridDim.x * chunk) {
-        if (threadIdx.x == 0) {
-            quit = (int) (__hip_atomic_load(a.stop, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) - a.seq) >= 0;
-        }
-        __syncthreads();
-        if (quit) break;
+        // the stop flag (host memory, slow to read) is fetched alongside this chunk's loads and acted on after them
+        unsigned int flag = 0;
+        if (threadIdx.x == 0) flag = __hip_atomic_load(a.stop, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         while (r < a.n - 1 && off >= a.end[r]) r++;
         const unsigned long long base = r ? a.end[r - 1] : 0;
         const unsigned long long lim  = a.end[r];
 #pragma unroll
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < PF_U; k++) {
             const unsigned long long o = off + (unsigned long long) (k * PF_NT + threadIdx.x) * 16;
             if (o < lim) {
                 const int4 v = *(const int4 *) (a.p[r] + (o - base));
                 acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
             }
         }
+        done++;
+        if (threadIdx.x == 0 && (int) (flag - a.seq) >= 0) quit = 1;
         __syncthreads();
+        if (quit) break;
     }
     if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x7f3a5c21) a.sink[0] = 1;   // keeps the loads
+    if (a.count && threadIdx.x == 0) __hip_atomic_fetch_add(a.count, done * PF_U / 4, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 // LLAMA_GPU_PREFETCH_STREAM=1: the prefetch runs on its own stream, concurrently with the overlap prefix
@@ -75,10 +83,21 @@ extern "C" unsigned int ggml_cuda_fork_prefetch(void * backend_ctx, int n, const
     }
     const unsigned int seq = ++g_pf_seq;
     if (a.n == 0) return seq;
+    static unsigned long long * cnt = nullptr; static unsigned long long req = 0, calls = 0;
+    static const bool log = getenv("LLAMA_GPU_PREFETCH_LOG") != nullptr;
+    if (log && !cnt) { CUDA_CHECK(cudaMallocHost((void **) &cnt, sizeof(*cnt))); *cnt = 0; }
+    a.count = cnt;
+    if (log) {
+        req += tot; calls++;
+        if (calls % 4800 == 0) {
+            fprintf(stderr, "[prefetch] per call: requested %.1f MB, read %.1f MB\n", req / 4800.0 / 1e6, __atomic_load_n(cnt, __ATOMIC_RELAXED) * (double) (PF_NT*16*4) / 4800.0 / 1e6);
+            req = 0; __atomic_store_n(cnt, 0ull, __ATOMIC_RELAXED);
+        }
+    }
     a.seq  = seq;
     a.stop = g_pf_stop;
     a.sink = g_pf_sink;
-    static const int grid = [] { const char * e = getenv("LLAMA_GPU_PREFETCH_GRID"); return e ? atoi(e) : 80; }();
+    static const int grid = [] { const char * e = getenv("LLAMA_GPU_PREFETCH_GRID"); return e ? atoi(e) : 40; }();
     if (ggml_cuda_fork_prefetch_concurrent()) {
         // on its own low-priority stream, after the work queued so far (the previous split): runs alongside the
         // overlap prefix that is queued next on the main stream
