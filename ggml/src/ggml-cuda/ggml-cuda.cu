@@ -2279,7 +2279,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            if ((dst->src[0]->flags & GGML_TENSOR_FLAG_CPU_EXACT) && ggml_cuda_cpu_exact_supported(dst)) {
+            if ((dst->flags & GGML_TENSOR_FLAG_CPU_EXACT) && ggml_get_op_params_i32(dst, 0) == GGML_CX_BLOCK_MAGIC) {
+                ggml_cuda_ecache_block_exact(ctx, dst);
+            } else if ((dst->src[0]->flags & GGML_TENSOR_FLAG_CPU_EXACT) && ggml_cuda_cpu_exact_supported(dst)) {
                 ggml_cuda_mul_mat_id_cpu_exact(ctx, dst);
             } else {
                 ggml_cuda_mul_mat_id(ctx, dst);

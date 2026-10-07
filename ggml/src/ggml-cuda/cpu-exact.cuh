@@ -16,3 +16,7 @@ void ggml_cuda_swiglu_cpu_exact(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 // MUL_MAT_ID gate + MUL_MAT_ID up + SWIGLU (all CPU_EXACT) in one kernel; false if the pattern does not fit
 bool ggml_cuda_moe_gate_up_swiglu_cpu_exact(ggml_backend_cuda_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * glu);
+
+#define GGML_CX_BLOCK_MAGIC 0x45434231   // 'ECB1'
+// the whole cached-expert block of a layer (see cpu-exact.cu)
+void ggml_cuda_ecache_block_exact(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

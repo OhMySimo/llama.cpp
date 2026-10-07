@@ -1827,8 +1827,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_moe_tiered(ggml_tensor * cur, c
         // cached experts on the GPU, expanded here: the head of the GPU split that follows the CPU products, so the
         // scheduler launches them before the CPU work (overlap). The CPU writes zeros for these slots and the GPU
         // writes zeros for the others, so eg + e gives every slot its single value (x + 0 = x)
-        ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok);
-        for (int gi = 0; gi < 2; gi++) {
+        static const bool block = ecache_exact() && (!getenv("LLAMA_EC_BLOCK") || atoi(getenv("LLAMA_EC_BLOCK")) != 0);
+        const ecache_group & G1 = g_ec.L[il][0];
+        const ecache_group & G2 = g_ec.L[il][1];
+        if (block && (G1.cap || G2.cap)) {
+            // both groups' cached experts in one CUDA op (ggml-cuda/cpu-exact.cu: 3 launches instead of ~14 kernels)
+            eg = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, k, n_tok);
+            eg->op = GGML_OP_MUL_MAT_ID;
+            eg->flags |= GGML_TENSOR_FLAG_CPU_EXACT;
+            const int32_t params[3] = { 0x45434231 /* GGML_CX_BLOCK_MAGIC */, G1.cap, G2.cap };
+            memcpy(eg->op_params, params, sizeof(params));
+            eg->src[0] = G1.cap ? G1.cache[0] : G2.cache[0];
+            eg->src[1] = x;
+            eg->src[2] = sel;
+            eg->src[3] = G1.cap ? G1.cache[1] : nullptr;
+            eg->src[4] = G1.cap ? G1.cache[2] : nullptr;
+            eg->src[5] = G1.cap && G2.cap ? G2.cache[0] : nullptr;
+            eg->src[6] = G2.cap ? G2.cache[1] : nullptr;
+            eg->src[7] = G2.cap ? G2.cache[2] : nullptr;
+            eg->src[8] = G1.cap ? G1.map : nullptr;
+            eg->src[9] = G2.cap ? G2.map : nullptr;
+            cb(eg, "ffn_moe_cached", il);
+        }
+        ggml_tensor * sel_flat = block ? nullptr : ggml_reshape_1d(ctx0, ggml_cont(ctx0, sel), k * n_tok);
+        for (int gi = 0; gi < 2 && !block; gi++) {
             const ecache_group & g = g_ec.L[il][gi];
             if (g.cap == 0) continue;
             ggml_tensor * idg = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, g.map, sel_flat), k, n_tok), GGML_TYPE_I32);

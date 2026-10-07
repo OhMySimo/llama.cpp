@@ -438,3 +438,110 @@ void ggml_cuda_swiglu_cpu_exact(ggml_backend_cuda_context & ctx, ggml_tensor * d
                                               (char *) dst->data, dst->nb[1], nc);
     CUDA_CHECK(cudaGetLastError());
 }
+
+
+// ---------------------------------------------------------------- whole cached-expert block in one op
+// dst (op MUL_MAT_ID, flag CPU_EXACT, op_params[0] = GGML_CX_BLOCK_MAGIC, [1] cap of group 1 (0 = none), [2] cap of
+// group 2): srcs 0 g1 gate (or g2 gate), 1 x [n_embd, 1, n_tok], 2 router top-k ids [k, n_tok], 3/4 g1 up/down,
+// 5/6/7 g2 gate/up/down, 8/9 F32 maps global id -> slot (cap = not cached). Output [n_embd, k, n_tok]: the expert's
+// output for slots cached in either group, 0 elsewhere. Three launches: q8_K of x, gate+up+swiglu, down (with the
+// q8_0 of the swiglu output done per block). Same arithmetic as the separate ops.
+
+static __device__ __forceinline__ float cx_row_dyn(int type, const char * xrow, const char * ycol, int nb, int L) {
+    switch (type) {
+        case GGML_TYPE_IQ3_XXS: return cx_row<GGML_TYPE_IQ3_XXS>(xrow, ycol, nb, L);
+        case GGML_TYPE_IQ2_XXS: return cx_row<GGML_TYPE_IQ2_XXS>(xrow, ycol, nb, L);
+        default:                return cx_row<GGML_TYPE_Q4_K>(xrow, ycol, nb, L);
+    }
+}
+
+struct cx_grp { const char * gate; const char * up; const char * down; const float * map; size_t nb01, nb02, dnb01, dnb02; int type, cap; };
+
+static __device__ __forceinline__ int cx_find(const cx_grp & g1, const cx_grp & g2, int e, int & cs) {
+    if (g1.cap) { cs = (int) g1.map[e]; if (cs < g1.cap) return 0; }
+    if (g2.cap) { cs = (int) g2.map[e]; if (cs < g2.cap) return 1; }
+    return -1;
+}
+
+static __global__ void cx_block_gateup(cx_grp g1, cx_grp g2, const char * ids, size_t ids_nb0, size_t ids_nb1,
+                                       const char * qy, size_t qy_col_bytes, int nb, int n_ff, int k, float * h) {
+    const int L = threadIdx.x & 7, row = blockIdx.x*CX_ROWS_BLOCK + (threadIdx.x >> 3), slot = blockIdx.y, tok = blockIdx.z;
+    if (row >= n_ff) return;
+    const int e = *(const int32_t *) (ids + slot*ids_nb0 + tok*ids_nb1);
+    int cs = 0;
+    const int grp = cx_find(g1, g2, e, cs);
+    if (grp < 0) return;                       // not cached: this slot's h is never read
+    const cx_grp & g = grp == 0 ? g1 : g2;
+    const size_t off = (size_t) cs*g.nb02 + (size_t) row*g.nb01;
+    const char * ycol = qy + (size_t) tok*qy_col_bytes;
+    const float r = cx_row_dyn(g.type, g.gate + off, ycol, nb, L);
+    const float u = cx_row_dyn(g.type, g.up   + off, ycol, nb, L);
+    if (L == 0) {
+        h[((size_t) tok*k + slot)*n_ff + row] = (r / (1.0f + cx_v_expf(0.0f - r))) * u;
+    }
+}
+
+static __global__ void cx_block_down(cx_grp g1, cx_grp g2, const char * ids, size_t ids_nb0, size_t ids_nb1,
+                                     const float * h, int n_ff, int n_embd, int k, char * dst, size_t dst_nb1, size_t dst_nb2) {
+    const int L = threadIdx.x & 7, row = blockIdx.x*CX_ROWS_BLOCK + (threadIdx.x >> 3), slot = blockIdx.y, tok = blockIdx.z;
+    const int e = *(const int32_t *) (ids + slot*ids_nb0 + tok*ids_nb1);
+    float * out = (float *) (dst + slot*dst_nb1 + tok*dst_nb2);
+    int cs = 0;
+    const int grp = cx_find(g1, g2, e, cs);    // uniform over the block
+    if (grp < 0) {
+        if (L == 0 && row < n_embd) out[row] = 0.0f;
+        return;
+    }
+    // x86 AVX2 quantize_row_q8_0 of this slot's swiglu output, one 32-value block per wave
+    __shared__ block_q8_0 sq[CX_MAX_NB];
+    const int nbq = n_ff / QK8_0;
+    const float * hs = h + ((size_t) tok*k + slot)*n_ff;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (int b = wave; b < nbq; b += blockDim.x / 32) {
+        const float v = hs[b*QK8_0 + lane];
+        float m = fabsf(v);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
+        const float id = m != 0.0f ? 127.f / m : 0.0f;
+        sq[b].qs[lane] = (int8_t) (int) rintf(v * id);
+        if (lane == 0) sq[b].d = __float2half_rn(m / 127.f);
+    }
+    __syncthreads();
+    if (row >= n_embd) return;
+    const cx_grp & g = grp == 0 ? g1 : g2;
+    const float r = cx_row<GGML_TYPE_IQ4_NL>(g.down + (size_t) cs*g.dnb02 + (size_t) row*g.dnb01, (const char *) sq, nbq, L);
+    if (L == 0) out[row] = r;
+}
+
+void ggml_cuda_ecache_block_exact(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int32_t cap1 = ggml_get_op_params_i32(dst, 1), cap2 = ggml_get_op_params_i32(dst, 2);
+    const ggml_tensor * x = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    auto grp = [&](const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down, const ggml_tensor * map, int cap) {
+        cx_grp g = {};
+        if (!cap) return g;
+        GGML_ASSERT(gate->type == up->type && down->type == GGML_TYPE_IQ4_NL);
+        GGML_ASSERT(gate->type == GGML_TYPE_IQ3_XXS || gate->type == GGML_TYPE_IQ2_XXS || gate->type == GGML_TYPE_Q4_K);
+        g.gate = (const char *) gate->data; g.up = (const char *) up->data; g.down = (const char *) down->data;
+        g.map = (const float *) map->data; g.nb01 = gate->nb[1]; g.nb02 = gate->nb[2]; g.dnb01 = down->nb[1]; g.dnb02 = down->nb[2];
+        g.type = gate->type; g.cap = cap;
+        return g;
+    };
+    const cx_grp g1 = grp(dst->src[0], dst->src[3], dst->src[4], dst->src[8], cap1);
+    const cx_grp g2 = grp(cap1 ? dst->src[5] : dst->src[0], dst->src[6], dst->src[7], dst->src[9], cap2);
+    const ggml_tensor * gt = dst->src[0];
+    const int n_embd = x->ne[0], n_ff = gt->ne[1], k = ids->ne[0], n_tok = ids->ne[1];
+    GGML_ASSERT(gt->ne[0] == n_embd && n_embd % QK_K == 0 && n_ff % QK8_0 == 0 && n_ff / QK8_0 <= CX_MAX_NB && n_embd / QK_K <= CX_MAX_NB);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && dst->ne[0] == n_embd);
+    cudaStream_t stream = ctx.stream();
+
+    const size_t col_bytes = ggml_row_size(GGML_TYPE_Q8_K, n_embd);
+    ggml_cuda_pool_alloc<char>  qy(ctx.pool(), (size_t) n_tok*col_bytes);
+    ggml_cuda_pool_alloc<float> h(ctx.pool(), (size_t) n_tok*k*n_ff);
+    cx_quantize_q8_K<false><<<dim3(n_embd/QK_K, n_tok), 256, 0, stream>>>((const char *) x->data, x->nb[2], (block_q8_K *) qy.get(), n_embd/QK_K);
+    cx_block_gateup<<<dim3((n_ff + CX_ROWS_BLOCK - 1)/CX_ROWS_BLOCK, k, n_tok), 8*CX_ROWS_BLOCK, 0, stream>>>(
+        g1, g2, (const char *) ids->data, ids->nb[0], ids->nb[1], qy.get(), col_bytes, n_embd/QK_K, n_ff, k, h.get());
+    cx_block_down<<<dim3((n_embd + CX_ROWS_BLOCK - 1)/CX_ROWS_BLOCK, k, n_tok), 8*CX_ROWS_BLOCK, 0, stream>>>(
+        g1, g2, (const char *) ids->data, ids->nb[0], ids->nb[1], h.get(), n_ff, n_embd, k, (char *) dst->data, dst->nb[1], dst->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+}
