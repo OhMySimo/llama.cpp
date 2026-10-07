@@ -3472,6 +3472,47 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// (fork) recurrent state read: GET_ROWS(cache, s_copy) of a one-cell cache returns that cell, whatever the index, and
+// its only consumer is a gated_delta_net whose state snapshot is fused into the cache (the kernel reads each state
+// element before writing the same element, from the same thread). The copy is skipped and the kernel reads the cell
+// in place: same values. Nothing between the two nodes may write the cell. Map: elided GET_ROWS -> cell data.
+static std::unordered_map<const ggml_tensor *, const float *> g_rs_elided;
+
+static bool ggml_cuda_rs_get_rows_elidable(const ggml_cgraph * cgraph, int i) {
+    static const bool off = getenv("LLAMA_NO_RS_ELIDE") != nullptr;
+    const ggml_tensor * g = cgraph->nodes[i];
+    const ggml_tensor * c = g->src[0];
+    if (off || g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32 || c->type != GGML_TYPE_F32 || (g->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        c->ne[1] != 1 || c->ne[2] != 1 || c->ne[3] != 1 || g->ne[1] != 1 || g->ne[2] != 1 || g->ne[3] != 1 || !ggml_is_contiguous(c) || c->data == nullptr) {
+        return false;
+    }
+    const char * lo = (const char *) c->data, * hi = lo + ggml_nbytes(c);
+    auto reaches_g = [&](const ggml_tensor * t) { for (; t; t = t->view_src) if (t == g) return true; return false; };
+    bool found = false;
+    for (int j = i + 1; j < cgraph->n_nodes; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        bool uses = false;
+        for (int k = 0; k < GGML_MAX_SRC; k++) if (n->src[k] && reaches_g(n->src[k])) uses = true;
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;   // views of g are followed through reaches_g
+        }
+        if (uses) {
+            ggml_cuda_gated_delta_net_fused_cache tmp;
+            if (found || n->op != GGML_OP_GATED_DELTA_NET || !reaches_g(n->src[5]) || ggml_cuda_try_gdn_cache_fusion(cgraph, j, tmp) <= 0) {
+                return false;
+            }
+            for (int k = 0; k < 5; k++) if (reaches_g(n->src[k])) return false;
+            found = true;
+            continue;
+        }
+        if (!found && ggml_nbytes(n) > 0 && n->data) {   // a write to the cell before the kernel reads it
+            const char * a = (const char *) n->data, * b = a + ggml_nbytes(n);
+            if (a < hi && lo < b) return false;
+        }
+    }
+    return found;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     {   // (fork) CPU-exact expert block: gate + up + swiglu in one kernel (same arithmetic)
         ggml_tensor * n0 = cgraph->nodes[i];
@@ -3518,6 +3559,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
+            for (const ggml_tensor * t = node->src[5]; t; t = t->view_src) {
+                auto it = g_rs_elided.find(t);
+                if (it != g_rs_elided.end()) { fused_state_cpy.state_in = it->second; break; }
+            }
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
@@ -4418,6 +4463,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_rs_get_rows_elidable(cgraph, i)) {
+                    g_rs_elided[node] = (const float *) node->src[0]->data;
+                    continue;
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4560,6 +4609,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_graph_epoch++;
+    g_rs_elided.clear();
     static const bool q8_memo = !getenv("LLAMA_NO_Q8_MEMO");
     if (q8_memo && !ggml_cuda_q8_memo_buf) {
         CUDA_CHECK(cudaMalloc(&ggml_cuda_q8_memo_buf, GGML_CUDA_Q8_MEMO_SIZE));
