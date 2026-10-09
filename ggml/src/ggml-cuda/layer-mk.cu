@@ -18,6 +18,8 @@
 
 #include <vector>
 #include <algorithm>
+#include <unordered_map>
+#include <cstring>
 
 bool ggml_cuda_op_mul_mat_use_fwht_fork(const ggml_tensor * op);   // fwht.cu
 
@@ -712,7 +714,8 @@ static __device__ void mk_fwht(const mk_stage & s) {
 }
 
 __launch_bounds__(MK_NT, 1)
-static __global__ void layer_mk_kernel(const mk_prog p) {
+static __global__ void layer_mk_kernel(const mk_prog * __restrict__ pp) {
+    const mk_prog & p = *pp;
     __shared__ float s_red[32];
     __shared__ block_q8_1 ys[MK_MAXQB];
     __shared__ float s_vals[256];
@@ -1399,7 +1402,32 @@ int ggml_cuda_try_layer_mk(ggml_backend_cuda_context & ctx, ggml_cgraph * g, int
     p.ts = ts_on ? ts : nullptr;
     for (int k = 0; k < p.n; k++) p.s[k] = B.st[k];
     p.s[p.n - 1].bar = 1;
-    layer_mk_kernel<<<grid, MK_NT, 0, ctx.stream()>>>(p);
+    // the program lives in VRAM, not in the kernel arguments: HIP allocates host-visible memory (an IOMMU mapping)
+    // for kernel arguments of this size at every launch and fails hipGraphExecUpdate on such nodes, re-instantiating
+    // the graph each time; with a fragmented IOVA space that made decoding fall to <1 tok/s and finally crash.
+    // Content-addressed and never freed, so a captured graph can keep pointing at its copy.
+    const mk_prog * dp = nullptr;
+    {
+        static std::unordered_multimap<uint64_t, std::pair<mk_prog *, mk_prog *>> cache;   // hash -> (host copy, device copy)
+        static cudaStream_t up = nullptr;
+        const size_t nb = offsetof(mk_prog, s) + p.n*sizeof(mk_stage);
+        uint64_t h = 1469598103934665603ull;
+        for (size_t q = 0; q < nb; q++) h = (h ^ ((const unsigned char *) &p)[q])*1099511628211ull;
+        auto r = cache.equal_range(h);
+        for (auto it = r.first; it != r.second && !dp; ++it) if (memcmp(it->second.first, &p, nb) == 0) dp = it->second.second;
+        if (!dp) {
+            // ponytail: entries are never evicted; fine while the set of distinct programs stays small (LLAMA_MK_DBG prints it)
+            mk_prog * hc = (mk_prog *) malloc(nb); memcpy(hc, &p, nb);
+            mk_prog * dc; CUDA_CHECK(cudaMalloc(&dc, nb));
+            if (!up) CUDA_CHECK(cudaStreamCreateWithFlags(&up, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaMemcpyAsync(dc, hc, nb, cudaMemcpyHostToDevice, up));   // own stream: legal while ctx.stream() captures
+            CUDA_CHECK(cudaStreamSynchronize(up));
+            cache.emplace(h, std::make_pair(hc, dc)); dp = dc;
+            static const bool dbg = getenv("LLAMA_MK_DBG") != nullptr;
+            if (dbg && (cache.size() & (cache.size() - 1)) == 0) fprintf(stderr, "[layer-mk] %zu distinct programs in VRAM\n", cache.size());
+        }
+    }
+    layer_mk_kernel<<<grid, MK_NT, 0, ctx.stream()>>>(dp);
     CUDA_CHECK(cudaGetLastError());
     {
         static const long check_at = getenv("LLAMA_MK_CHECK") ? atol(getenv("LLAMA_MK_CHECK")) : -1;
