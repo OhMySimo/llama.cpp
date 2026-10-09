@@ -2688,7 +2688,8 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
-        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        const cudaError_t derr = cudaGraphExecDestroy(graph->instance);   // (fork) HIP may refuse an instance whose update failed
+        if (derr != cudaSuccess) { (void)cudaGetLastError(); GGML_LOG_WARN("%s: graph exec destroy failed (%s), dropping the instance\n", __func__, cudaGetErrorString(derr)); }
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
     } else {
@@ -4609,10 +4610,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool fresh = false;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            fresh = true;
         }
-        if (cuda_graph_update_required) { // Update graph executable
+        // (fork) an instance made from this very graph needs no update: on HIP the update can fail with
+        // "invalid argument" (graphs captured across two streams), and the destroy + re-instantiate that
+        // follows then aborted or corrupted the heap
+        if (cuda_graph_update_required && !fresh) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph

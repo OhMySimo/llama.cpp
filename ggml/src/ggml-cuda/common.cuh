@@ -1466,10 +1466,12 @@ struct ggml_backend_cuda_context {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+        // (fork) LLAMA_GRAPH_EVICT_MS: shorter window, a stress test for graph destruction (debug)
+        static const int64_t evict_us = getenv("LLAMA_GRAPH_EVICT_MS") ? atoll(getenv("LLAMA_GRAPH_EVICT_MS"))*1000 : 10'000'000;
+        if (time_now - last_graph_eviction_sweep >= std::min<int64_t>(5'000'000, evict_us/2)) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (time_now - it->second->last_used_time >= evict_us) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
